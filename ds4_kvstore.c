@@ -1294,8 +1294,12 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     engine, loaded_tokens, prompt_text + text_bytes,
                     effective_prompt);
             }
-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
-                hooks->load(hooks->ud, fp, hooks->load_wanted);
+            if (hooks && (hooks->load || hooks->load_ext) &&
+                (hdr.ext_flags & hooks->ext_flag)) {
+                if (hooks->load_ext)
+                    hooks->load_ext(hooks->ud, fp, hooks->load_wanted, hdr.ext_flags);
+                else
+                    hooks->load(hooks->ud, fp, hooks->load_wanted);
             }
         } else {
             ds4_session_invalidate(session);

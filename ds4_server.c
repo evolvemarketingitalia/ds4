@@ -10823,6 +10823,7 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_EXT_VISION DS4_KVSTORE_EXT_VISION
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
@@ -11255,6 +11256,104 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+/* Disk checkpoints of sessions that hold images carry the image identities
+ * (position, token count, fingerprint) in the trailer, ahead of the tool map.
+ * A load validates them against the request's images before the payload is
+ * trusted, then installs them into the session. */
+#define KV_VISION_TRAILER_MAGIC "DSVI"
+#define KV_VISION_TRAILER_MAX 16
+
+typedef struct {
+    server *s;
+    ds4_vision_identity_record images[KV_VISION_TRAILER_MAX];
+    size_t image_count;   /* store: identities to write; load: identities read */
+    bool loaded_vision;   /* load: a vision section was present */
+    bool vision_mismatch; /* load: the vision section was unreadable */
+} kv_trailer_ctx;
+
+static uint64_t kv_vision_trailer_bytes(size_t n) {
+    return n ? 8u + 40u * (uint64_t)n : 0u;
+}
+
+static bool kv_cache_trailer_size_cb(void *ud, const char *text, uint64_t *bytes_out) {
+    kv_trailer_ctx *c = ud;
+    uint64_t tool = 0;
+    if (!kv_tool_map_serialized_size(c->s, text, &tool)) return false;
+    if (bytes_out) *bytes_out = tool + kv_vision_trailer_bytes(c->image_count);
+    return true;
+}
+
+static bool kv_cache_trailer_write_cb(void *ud, FILE *fp, const char *text,
+                                      uint64_t *written_bytes) {
+    kv_trailer_ctx *c = ud;
+    uint64_t vision = 0, tool = 0;
+    if (written_bytes) *written_bytes = 0;
+    if (c->image_count) {
+        uint8_t h[8];
+        memcpy(h, KV_VISION_TRAILER_MAGIC, 4);
+        le_put32(h + 4, (uint32_t)c->image_count);
+        if (fwrite(h, 1, sizeof(h), fp) != sizeof(h)) return false;
+        for (size_t i = 0; i < c->image_count; i++) {
+            uint8_t rec[40];
+            le_put32(rec, c->images[i].token_start);
+            le_put32(rec + 4, c->images[i].token_count);
+            memcpy(rec + 8, c->images[i].fingerprint, 32);
+            if (fwrite(rec, 1, sizeof(rec), fp) != sizeof(rec)) return false;
+        }
+        vision = kv_vision_trailer_bytes(c->image_count);
+    }
+    if (!kv_tool_map_write(c->s, fp, text, &tool)) return false;
+    if (written_bytes) *written_bytes = vision + tool;
+    return true;
+}
+
+static int kv_cache_trailer_load_ext_cb(void *ud, FILE *fp, const void *wanted,
+                                        uint8_t ext_flags) {
+    kv_trailer_ctx *c = ud;
+    if (ext_flags & KV_EXT_VISION) {
+        uint8_t h[8];
+        if (fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+            memcmp(h, KV_VISION_TRAILER_MAGIC, 4) != 0) {
+            c->vision_mismatch = true;
+            return 0;
+        }
+        const uint32_t n = le_get32(h + 4);
+        if (n > KV_VISION_TRAILER_MAX) {
+            c->vision_mismatch = true;
+            return 0;
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            uint8_t rec[40];
+            if (fread(rec, 1, sizeof(rec), fp) != sizeof(rec)) {
+                c->vision_mismatch = true;
+                return 0;
+            }
+            c->images[i].token_start = le_get32(rec);
+            c->images[i].token_count = le_get32(rec + 4);
+            memcpy(c->images[i].fingerprint, rec + 8, 32);
+        }
+        c->image_count = n;
+        c->loaded_vision = true;
+    }
+    if (ext_flags & KV_EXT_TOOL_MAP)
+        return kv_tool_map_load_from_pos(c->s, fp, (const stop_list *)wanted);
+    return 0;
+}
+
+static ds4_kvstore_trailer_hooks kv_cache_trailer_hooks(kv_trailer_ctx *c,
+                                                        uint8_t ext_flag,
+                                                        const stop_list *wanted) {
+    return (ds4_kvstore_trailer_hooks){
+        .ud = c,
+        .ext_flag = ext_flag,
+        .serialized_size = kv_cache_trailer_size_cb,
+        .write = kv_cache_trailer_write_cb,
+        .load = NULL,
+        .load_ext = kv_cache_trailer_load_ext_cb,
+        .load_wanted = wanted,
+    };
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -11263,17 +11362,21 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const char *cache_text_key) {
     if (!s || !slot) return false;
     char err[160] = {0};
-    ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    kv_trailer_ctx ctx = { .s = s };
     pthread_mutex_lock(&s->inference_mu);
-    /* The payload contains image-conditioned KV rows, but the disk key and
-     * trailer do not contain image fingerprints. Never let generic image
-     * placeholder tokens become a cache hit for a different image.
-     * sync_image_count covers progress-callback writes during prefill;
-     * checkpoint_image_count covers completed sessions. */
-    if (ds4_session_has_vision_state(slot->session)) {
+    /* The payload may contain image-conditioned KV rows: store their image
+     * identities in the trailer so a load can verify them against the
+     * request's images (the text key alone cannot).  A boundary that cuts
+     * through an image is skipped.  sync images cover progress-callback
+     * writes during prefill; checkpoint images cover completed sessions. */
+    if (!ds4_session_vision_identities_for_prefix(slot->session, store_len,
+                                                  ctx.images, KV_VISION_TRAILER_MAX,
+                                                  &ctx.image_count)) {
         pthread_mutex_unlock(&s->inference_mu);
         return false;
     }
+    ds4_kvstore_trailer_hooks hooks = kv_cache_trailer_hooks(
+        &ctx, (uint8_t)(KV_EXT_TOOL_MAP | (ctx.image_count ? KV_EXT_VISION : 0)), NULL);
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
@@ -11464,6 +11567,111 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   req && req->api == API_RESPONSES);
 }
 
+/* Longest disk checkpoint prefix available for this request, in tokens (0
+ * when none).  Used to keep a live rewind from discarding a longer restore. */
+static int kv_cache_disk_prefix_tokens(server *s, server_slot *slot,
+                                       const request *req) {
+    if (!s || !slot || !req || !s->kv.enabled) return 0;
+    char *rendered = NULL;
+    const char *text = req->prompt_text;
+    if (req->image_count) {
+        size_t len = 0;
+        rendered = ds4_kvstore_render_tokens_text(s->engine, &req->prompt, &len);
+        text = rendered;
+    }
+    int tokens = 0;
+    if (text && text[0]) {
+        pthread_mutex_lock(&s->kv_mu);
+        const int idx = ds4_kvstore_find_text_prefix(
+            &s->kv, text, ds4_engine_model_id(s->engine),
+            ds4_engine_routed_quant_bits(s->engine), ds4_session_ctx(slot->session));
+        if (idx >= 0) tokens = (int)s->kv.entry[idx].tokens;
+        pthread_mutex_unlock(&s->kv_mu);
+    }
+    free(rendered);
+    return tokens;
+}
+
+/* Multimodal requests key their disk checkpoints by the rendered prompt
+ * tokens (client text carries per-request image marker nonces) and validate
+ * the stored image identities against the request before trusting the
+ * payload.  The exact loaded tokens must prefix the request tokens: no text
+ * suffix is re-tokenized, so image token blocks are never guessed. */
+static int kv_cache_try_load_multimodal(server *s, server_slot *slot,
+                                        const request *req,
+                                        char **loaded_path_out,
+                                        uint8_t *loaded_ext_flags_out) {
+    if (loaded_path_out) *loaded_path_out = NULL;
+    if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    if (!s || !slot || !req || !s->kv.enabled) return 0;
+    size_t text_len = 0;
+    char *lookup = ds4_kvstore_render_tokens_text(s->engine, &req->prompt, &text_len);
+    if (!lookup || text_len == 0) {
+        free(lookup);
+        return 0;
+    }
+    kv_trailer_ctx ctx = { .s = s };
+    ds4_kvstore_trailer_hooks hooks = kv_cache_trailer_hooks(
+        &ctx, (uint8_t)(KV_EXT_TOOL_MAP | KV_EXT_VISION), NULL);
+    ds4_kvstore_load_result lr = {0};
+    pthread_mutex_lock(&s->inference_mu);
+    if (ds4_session_has_vision_state(slot->session)) {
+        ds4_session_invalidate(slot->session);
+    }
+    pthread_mutex_lock(&s->kv_mu);
+    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
+                                           lookup, NULL, &lr, &hooks,
+                                           req->api == API_RESPONSES);
+    pthread_mutex_unlock(&s->kv_mu);
+    const char *reject = NULL;
+    if (loaded > 0) {
+        const ds4_tokens *live = ds4_session_tokens(slot->session);
+        if (!live || live->len != loaded ||
+            !ds4_tokens_starts_with(&req->prompt, live)) {
+            reject = "token prefix mismatch";
+        } else if (ctx.vision_mismatch) {
+            reject = "vision trailer unreadable";
+        } else {
+            /* Every request image inside the loaded prefix must be the stored
+             * one, and every stored image must be in the request. */
+            size_t i = 0;
+            for (; i < req->image_count &&
+                   req->images[i].token_start < (uint32_t)loaded; i++) {
+                if (i >= ctx.image_count ||
+                    ctx.images[i].token_start != req->images[i].token_start ||
+                    ctx.images[i].token_count != req->images[i].embedding.token_count ||
+                    memcmp(ctx.images[i].fingerprint,
+                           req->images[i].embedding.fingerprint, 32) != 0) {
+                    reject = "image identity mismatch";
+                    break;
+                }
+            }
+            if (!reject && i != ctx.image_count) reject = "stored image count mismatch";
+            if (!reject &&
+                !ds4_session_set_vision_identities(slot->session, ctx.images,
+                                                   ctx.image_count))
+                reject = "cannot install image identities";
+        }
+        if (reject) ds4_session_invalidate(slot->session);
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+    if (loaded > 0 && reject) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache multimodal load rejected tokens=%d images=%zu: %s",
+                   loaded, ctx.image_count, reject);
+        loaded = 0;
+    } else if (loaded > 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache hit multimodal tokens=%d images=%zu load=%.1f ms file=%s",
+                   loaded, ctx.image_count, lr.load_ms, lr.path ? lr.path : "?");
+        if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
+        if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
+    }
+    ds4_kvstore_load_result_free(&lr);
+    free(lookup);
+    return loaded;
+}
+
 /* A text-only suffix tokenizer would turn image markers into literal text.
  * Keep the exact live tokens and splice each new image's already-built token
  * block into the suffix. Historical image positions follow the live frontier,
@@ -11616,8 +11824,26 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * checkpoints. */
     if (!ds4_session_vision_fingerprint_prefix_matches(slot->session,
                                                        req->images,
-                                                       req->image_count))
+                                                       req->image_count)) {
+        /* V4.1 may still drop back below the slot's extra images when the
+         * prompt shares a prefix with the checkpoint: the rewind cuts those
+         * images away and ds4_session_vision_rewind_ok validates the kept
+         * ones against the request. */
+        if (ds4_engine_is_deepseek41(s->engine)) {
+            const int common = ds4_session_common_prefix(slot->session, &req->prompt);
+            if (common > 0 && common < live_pos) {
+                const int target = live_prefix_rewind_target(true, 2, live_pos,
+                                                             req->prompt.len, common);
+                if (target >= 0 &&
+                    ds4_session_vision_rewind_ok(slot->session, req->images,
+                                                 req->image_count, target)) {
+                    pr.kind = REUSE_MEMORY_REWIND;
+                    pr.reuse_tokens = target;
+                }
+            }
+        }
         return pr;
+    }
     const char *ptext = req->prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
 
@@ -11680,14 +11906,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
     const int common = ds4_session_common_prefix(slot->session, &req->prompt);
     const bool token_image_prefix = ds4_session_vision_prefix_matches(
         slot->session, req->images, req->image_count);
-    /* V4.1 rewinds exactly but only text-only checkpoints (ds4.c); a
-     * (NULL, 0) vision match is false while the checkpoint holds images. */
-    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine) &&
-        ds4_session_vision_prefix_matches(slot->session, NULL, 0);
+    /* V4.1 rewinds exactly.  A checkpoint that holds images can still be
+     * rewound when every image matches the request and ends before the
+     * target, and any new request image starts at or after it
+     * (ds4_session_vision_rewind_ok); the GLM tier keeps its prefix rule. */
+    const bool ds41_rewind = ds4_engine_is_deepseek41(s->engine);
     const int rewind_to = live_prefix_rewind_target(
         ds41_rewind || ds4_engine_is_glm_dsa(s->engine), ds41_rewind ? 2 : 1,
         live_pos, req->prompt.len, common == req->prompt.len ? common : 0);
-    if (rewind_to >= 0 && token_image_prefix) {
+    const bool rewind_images_ok = ds41_rewind ?
+        (rewind_to >= 0 &&
+         ds4_session_vision_rewind_ok(slot->session, req->images,
+                                      req->image_count, rewind_to)) :
+        token_image_prefix;
+    if (rewind_to >= 0 && rewind_images_ok) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
         return pr;
@@ -11734,11 +11966,12 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         return pr;
     }
 
-    if (ds41_rewind && token_image_prefix && common < live_pos &&
-        common < req->prompt.len) {
+    if (ds41_rewind && common < live_pos && common < req->prompt.len) {
         const int diverged_to = live_prefix_rewind_target(true, 2, live_pos,
                                                           req->prompt.len, common);
-        if (diverged_to >= 0) {
+        if (diverged_to >= 0 &&
+            ds4_session_vision_rewind_ok(slot->session, req->images,
+                                         req->image_count, diverged_to)) {
             pr.kind = REUSE_MEMORY_REWIND;
             pr.reuse_tokens = diverged_to;
             return pr;
@@ -12560,6 +12793,20 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
      * match. Starting at zero made the first scheduling slice truncate a
      * perfectly reusable long checkpoint, forcing a complete refill. */
     pthread_mutex_lock(&s->inference_mu);
+    {
+        /* Same trap as the text path: a diverged tail must not send the whole
+         * multimodal prefix back to token zero when V4.1 can rewind exactly to
+         * the shared prefix (every image before the target and matching). */
+        const int live = ds4_session_pos(slot->session);
+        const int common = ds4_session_common_prefix(slot->session, prompt);
+        if (common > 0 && common < live && ds4_engine_is_deepseek41(s->engine)) {
+            const int target = common < prompt->len ? common : prompt->len - 1;
+            const int even = target - (target & 1);
+            if (even >= 2 &&
+                ds4_session_vision_rewind_ok(slot->session, images, image_count, even))
+                ds4_session_rewind(slot->session, target);
+        }
+    }
     int done = server_multimodal_resume_pos(slot->session, prompt,
                                             images, image_count);
     pthread_mutex_unlock(&s->inference_mu);
@@ -13550,6 +13797,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         prompt_for_sync = &effective_prompt;
         break;
     case REUSE_MEMORY_REWIND: {
+        /* A disk checkpoint that covers more of this prompt than the rewind
+         * target beats the rewind: fall through to the disk tier instead of
+         * cutting the live session down to a short prefix. */
+        const int disk_tokens = kv_cache_disk_prefix_tokens(s, slot, &j->req);
+        if (disk_tokens > reuse.reuse_tokens) {
+            cached = 0;
+            cache_source = "none";
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: live prefix rewind to %d skipped: disk checkpoint covers %d tokens",
+                       reuse.reuse_tokens, disk_tokens);
+            break;
+        }
+        /* The tail being cut away may be the only copy of a conversation the
+         * client will come back to: persist the live session first when the
+         * cut is at least one continued-checkpoint interval. */
+        if (s->kv.enabled && old_pos >= s->kv.opt.min_tokens &&
+            old_pos - reuse.reuse_tokens >= s->kv.opt.continued_interval_tokens)
+            kv_cache_store_current(s, slot, "evict");
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
         /* Rewinding mutates the session, so re-validate before trusting the
@@ -13561,9 +13826,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_session_common_prefix(slot->session, &j->req.prompt) ==
                 reuse.reuse_tokens &&
             (!multimodal ||
-             ds4_session_vision_state_matches(slot->session,
-                                              j->req.images,
-                                              j->req.image_count));
+             ds4_session_vision_prefix_matches(slot->session,
+                                               j->req.images,
+                                               j->req.image_count));
         pthread_mutex_unlock(&s->inference_mu);
         if (rewind_valid) {
             live_materialized = true;
@@ -13640,7 +13905,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.image_count, cached, prompt_for_sync->len);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (!multimodal && s->kv.enabled && cached == 0 &&
+    if (s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
@@ -13655,6 +13920,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+        }
+    } else if (multimodal && cached == 0) {
+        disk_cached = kv_cache_try_load_multimodal(s, slot, &j->req,
+                                                   &disk_cache_path,
+                                                   &disk_cache_ext_flags);
+        if (disk_cached > 0) {
+            cached = disk_cached;
+            cache_source = "disk-multimodal";
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13841,7 +14114,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
-    if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+    kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13850,7 +14123,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags,
                now_sec() - t0);
     if (cold_store_len == prompt_for_sync->len) {
-        if (!multimodal && kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
             kv_cache_slot_note_store(slot, cold_store_len);
             suppressed_continued_last = -1;
@@ -13980,7 +14253,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            kv_cache_maybe_store_continued(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;

@@ -76102,6 +76102,105 @@ bool ds4_session_has_vision_state(const ds4_session *s) {
     return s && (s->checkpoint_image_count != 0 || s->sync_image_count != 0);
 }
 
+/* A V4.1 rewind rebuilds the Engram history from the three tokens before the
+ * target and may replay the token just below an odd target as text, so every
+ * checkpoint image must end this many tokens before the target. */
+#define DS4_V41_REWIND_IMAGE_MARGIN 4u
+
+/* Checkpoint images that start at or after `pos` are cut away by the rewind
+ * (ds4_session_rewind drops their identities); every earlier image must end
+ * DS4_V41_REWIND_IMAGE_MARGIN tokens before `pos`.  Returns the number of
+ * images kept, or -1 when an image straddles or crowds the target. */
+static int ds4_session_images_kept_by_rewind(const ds4_session *s, int pos) {
+    if (!s || pos < 0) return -1;
+    int kept = 0;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        const ds4_vision_identity *img = &s->checkpoint_images[i];
+        if (img->token_start >= (uint32_t)pos) continue;
+        const uint64_t end = (uint64_t)img->token_start + img->token_count;
+        if (end + DS4_V41_REWIND_IMAGE_MARGIN > (uint64_t)pos) return -1;
+        kept = (int)i + 1;
+    }
+    return kept;
+}
+
+static bool ds4_session_images_end_before(const ds4_session *s, int pos) {
+    return ds4_session_images_kept_by_rewind(s, pos) >= 0;
+}
+
+bool ds4_session_vision_rewind_ok(const ds4_session *s,
+                                  const ds4_vision_span *images,
+                                  size_t image_count, int pos) {
+    if (!s || !s->checkpoint_valid || pos < 0 ||
+        (image_count != 0 && !images)) return false;
+    const int kept = ds4_session_images_kept_by_rewind(s, pos);
+    if (kept < 0 || (size_t)kept > image_count) return false;
+    for (size_t i = 0; i < (size_t)kept; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *cur = &images[i];
+        if (old->token_start != cur->token_start ||
+            old->token_count != cur->embedding.token_count ||
+            memcmp(old->fingerprint, cur->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0) return false;
+    }
+    for (size_t i = (size_t)kept; i < image_count; i++)
+        if (images[i].token_start < (uint32_t)pos) return false;
+    return true;
+}
+
+bool ds4_session_vision_identities_for_prefix(const ds4_session *s, int prefix_len,
+                                              ds4_vision_identity_record *out,
+                                              size_t max, size_t *count_out) {
+    if (count_out) *count_out = 0;
+    if (!s || prefix_len < 0 || (max && !out)) return false;
+    size_t n = 0;
+    if (s->sync_image_count != 0) {
+        for (size_t i = 0; i < s->sync_image_count; i++) {
+            const ds4_vision_span *sp = &s->sync_images[i];
+            const uint64_t end = (uint64_t)sp->token_start + sp->embedding.token_count;
+            if (sp->token_start >= (uint32_t)prefix_len) break;
+            if (end > (uint64_t)prefix_len || n == max) return false;
+            out[n].token_start = sp->token_start;
+            out[n].token_count = sp->embedding.token_count;
+            memcpy(out[n].fingerprint, sp->embedding.fingerprint, sizeof(out[n].fingerprint));
+            n++;
+        }
+    } else {
+        for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+            const ds4_vision_identity *id = &s->checkpoint_images[i];
+            const uint64_t end = (uint64_t)id->token_start + id->token_count;
+            if (id->token_start >= (uint32_t)prefix_len) break;
+            if (end > (uint64_t)prefix_len || n == max) return false;
+            out[n].token_start = id->token_start;
+            out[n].token_count = id->token_count;
+            memcpy(out[n].fingerprint, id->fingerprint, sizeof(out[n].fingerprint));
+            n++;
+        }
+    }
+    if (count_out) *count_out = n;
+    return true;
+}
+
+bool ds4_session_set_vision_identities(ds4_session *s,
+                                       const ds4_vision_identity_record *ids,
+                                       size_t n) {
+    if (!s || (n != 0 && !ids)) return false;
+    ds4_vision_identity *copy = NULL;
+    if (n != 0) {
+        copy = calloc(n, sizeof(*copy));
+        if (!copy) return false;
+        for (size_t i = 0; i < n; i++) {
+            copy[i].token_start = ids[i].token_start;
+            copy[i].token_count = ids[i].token_count;
+            memcpy(copy[i].fingerprint, ids[i].fingerprint, sizeof(copy[i].fingerprint));
+        }
+    }
+    free(s->checkpoint_images);
+    s->checkpoint_images = copy;
+    s->checkpoint_image_count = n;
+    return true;
+}
+
 static bool ds4_session_vision_range_overlaps(
         const ds4_session *s,
         uint32_t           token_start,
@@ -86336,7 +86435,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * decode step, where invalidating would make the caller rebuild the whole
      * prefix from token 0. */
     if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
-        s->ds41_graph_ready && s->checkpoint_image_count == 0) {
+        s->ds41_graph_ready && ds4_session_images_end_before(s, pos - 1)) {
         const int keep = s->checkpoint.v[pos - 1];
         ds4_session_rewind(s, pos - 1);
         if (s->checkpoint_valid) {
@@ -86392,15 +86491,20 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    /* Text-only: the rebuilt Engram history (and an odd target's replayed
-     * token) would treat image positions as text. */
+    /* Images must end before the target: the rebuilt Engram history (and an
+     * odd target's replayed token) would treat image positions as text. */
     if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
-        s->checkpoint_image_count == 0 &&
+        ds4_session_images_end_before(s, pos) &&
         s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
         state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
 #endif
 #endif
     s->checkpoint.len = pos;
+    /* Image identities beyond the new frontier describe tokens that are gone. */
+    while (s->checkpoint_image_count > 0 &&
+           s->checkpoint_images[s->checkpoint_image_count - 1].token_start >=
+               (uint32_t)pos)
+        s->checkpoint_image_count--;
     /* DeepSeek compressors cannot be rolled back by truncating their row
      * counts. Without a saved frontier the caller must rebuild this prefix. */
     if (!state_ok) s->checkpoint_valid = false;

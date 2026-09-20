@@ -16,6 +16,8 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* Trailer carries the image identities of a multimodal checkpoint. */
+#define DS4_KVSTORE_EXT_VISION            (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -94,6 +96,9 @@ typedef struct {
     bool (*serialized_size)(void *ud, const char *text, uint64_t *bytes_out);
     bool (*write)(void *ud, FILE *fp, const char *text, uint64_t *written_bytes);
     int (*load)(void *ud, FILE *fp, const void *wanted);
+    /* Preferred over load when set: receives the file's ext flags so a
+     * trailer with several sections knows which ones are present. */
+    int (*load_ext)(void *ud, FILE *fp, const void *wanted, uint8_t ext_flags);
     const void *load_wanted;
 } ds4_kvstore_trailer_hooks;
 

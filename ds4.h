@@ -471,6 +471,31 @@ bool ds4_session_rebase_vision_state(const ds4_session *s,
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
+/* True when a V4.1 live session that holds images can still be rewound to
+ * `pos`: every checkpoint image must match the request's images (position,
+ * size, fingerprint) and end at least four tokens before `pos`, and no request
+ * image may start before `pos` beyond those.  Images earlier in the prefix are
+ * safe: the raw decode window is restored from the per-layer ring, and the
+ * Engram history is rebuilt only from the three text tokens before `pos`. */
+bool ds4_session_vision_rewind_ok(const ds4_session *s,
+                                  const ds4_vision_span *images,
+                                  size_t image_count, int pos);
+/* Image identities of a checkpoint, for disk checkpoints that survive a
+ * restart.  ..._for_prefix fills the images that end at or before prefix_len
+ * (from the sync in flight while a prefill runs, else from the checkpoint)
+ * and fails when an image straddles the boundary; ..._set installs
+ * identities after a payload load. */
+typedef struct {
+    uint32_t token_start;
+    uint32_t token_count;
+    uint8_t fingerprint[32];
+} ds4_vision_identity_record;
+bool ds4_session_vision_identities_for_prefix(const ds4_session *s, int prefix_len,
+                                              ds4_vision_identity_record *out,
+                                              size_t max, size_t *count_out);
+bool ds4_session_set_vision_identities(ds4_session *s,
+                                       const ds4_vision_identity_record *ids,
+                                       size_t n);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
