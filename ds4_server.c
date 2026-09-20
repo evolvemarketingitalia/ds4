@@ -12676,9 +12676,27 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* DS4_SERVER_PREFILL_QUANTUM: tokens per batched prefill slice while no
+ * generation is active (default 2048).  The V4.1 streaming sweep stages each
+ * layer's experts once per slice, so a wider slice reads the SSD proportionally
+ * fewer times; it must stay within the graph's carry capacity. */
+static int server_prefill_quantum_env(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 2048;
+        const char *env = getenv("DS4_SERVER_PREFILL_QUANTUM");
+        if (env && env[0]) {
+            char *end = NULL;
+            long v = strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v >= 128 && v <= 32768) cached = (int)v;
+        }
+    }
+    return cached;
+}
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    int quantum = generation_active ? s->mixed_prefill_quantum : server_prefill_quantum_env();
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
