@@ -77,6 +77,20 @@ static void routed_moe_decode_profile_print(void) {
              p->down_ms) / calls);
 }
 
+/* DS4_ROCM_SELECTED_SPLIT=1 enables the one-token resident/missing split.
+ * Off by default: it is faster but not yet bit-reproducible (see the split
+ * site).  DS4_ROCM_SELECTED_SPLIT_DRAIN=0 removes the stream drain that
+ * separates the resident kernels from the miss upload. */
+static int routed_moe_selected_split_enabled(void) {
+    const char *env = getenv("DS4_ROCM_SELECTED_SPLIT");
+    return env != NULL && env[0] != '0';
+}
+
+static int routed_moe_selected_split_drain(void) {
+    const char *env = getenv("DS4_ROCM_SELECTED_SPLIT_DRAIN");
+    return env == NULL || env[0] != '0';
+}
+
 static int routed_moe_decode_profile_enabled(void) {
     if (g_moe_decode_profile_enabled < 0) {
         const char *env = getenv("DS4_ROCM_MOE_DECODE_PROFILE");
@@ -691,10 +705,42 @@ static int routed_moe_launch(
                                            &up_slot_ptrs,
                                            &down_slot_ptrs,
                                            &stream_batch_unique);
-    /* The one-token resident/missing split can expose partially updated
-     * selected-expert state to the default stream. Keep the asynchronous
-     * read overlap, then use the deterministic compact table below. */
-    int split_selected = 0;
+    /* One-token resident/missing split: run the experts already resident in
+     * the cache while the misses are still in flight from the SSD, then run
+     * the misses.  The resident kernels are marked in flight before the
+     * upload, so any slot reuse waits for them, and the upload
+     * host-synchronizes its own stream, so the miss kernels launched after it
+     * observe complete expert data.  Opt-in: DS4_ROCM_SELECTED_SPLIT=1.
+     * Measured on gfx1151 at 12k context: decode 7.17 -> 7.47 t/s, but two
+     * runs of the same greedy prompt diverged after ~20 tokens, so the
+     * default stays on the deterministic compact table. */
+    int split_selected =
+        !stream_full_layer &&
+        n_tokens == 1u &&
+        routed_moe_selected_split_enabled() &&
+        cuda_stream_selected_apply_split(model_map,
+                                         layer_index,
+                                         n_total_expert,
+                                         n_expert,
+                                         gate_expert_bytes,
+                                         down_expert_bytes,
+                                         &selected_exec,
+                                         &gate_w,
+                                         &up_w,
+                                         &down_w,
+                                         &gate_slot_ptrs,
+                                         &up_slot_ptrs,
+                                         &down_slot_ptrs,
+                                         &stream_resident_mask,
+                                         &stream_missing_mask);
+    if (split_selected) {
+        static int logged_selected_split = 0;
+        if (!logged_selected_split) {
+            logged_selected_split = 1;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "SSD streaming routed MoE running resident experts before the miss reads land\n");
+        }
+    }
     const int compact_selected =
         split_selected ||
         (!stream_full_layer &&
@@ -1334,6 +1380,17 @@ static int routed_moe_launch(
                         clamp);
                 }
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
+                /* The upload below writes expert slots from its own stream
+                 * while these kernels still read theirs.  Mark them in flight
+                 * so any slot reuse waits, and drain the default stream so no
+                 * upload can land in a slot a resident kernel is still
+                 * reading.  The SSD reads keep running during the drain, which
+                 * is where the overlap comes from. */
+                if (ok) ok = cuda_stream_selected_mark_inflight();
+                if (ok && routed_moe_selected_split_drain()) {
+                    ok = cuda_ok(cudaStreamSynchronize(0),
+                                 "routed_moe split resident drain");
+                }
                 if (!ok) {
                     (void)cuda_stream_selected_finish_pending_missing(0);
                 } else {
@@ -2536,6 +2593,15 @@ static int routed_moe_launch(
                             "Q2 decode MoE profile resident gate/up end")) {
                         return 0;
                     }
+                }
+            }
+            /* As in the IQ2 split: the upload writes slots from its own
+             * stream while the resident kernels still read theirs. */
+            if (ok_gateup && stream_resident_mask != 0u) {
+                ok_gateup = cuda_stream_selected_mark_inflight();
+                if (ok_gateup && routed_moe_selected_split_drain()) {
+                    ok_gateup = cuda_ok(cudaStreamSynchronize(0),
+                                        "routed_moe q2 split resident drain");
                 }
             }
             if (!ok_gateup) {
