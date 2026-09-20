@@ -40328,6 +40328,13 @@ typedef struct {
     ds4_engram_table table[2];
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     ds4_gpu_tensor *window[40];
+    /* Every raw row also goes to a longer per-layer ring indexed by absolute
+     * position, so a session can be rewound (ds41_graph_rewind) with the
+     * decode window rebuilt from it: the window itself only keeps 128 rows.
+     * raw_log_from is the first position the ring has held since the last
+     * reset or snapshot load. */
+    ds4_gpu_tensor *raw_log[40];
+    uint32_t raw_log_rows, raw_log_from;
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
@@ -40373,7 +40380,10 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
         ds4_gpu_tensor_free(g->engram_q_norm[i]);
         ds4_gpu_tensor_free(g->engram_k_norm[i]);
     }
-    for (uint32_t i = 0; i < 40; i++) ds4_gpu_tensor_free(g->window[i]);
+    for (uint32_t i = 0; i < 40; i++) {
+        ds4_gpu_tensor_free(g->window[i]);
+        ds4_gpu_tensor_free(g->raw_log[i]);
+    }
     for (uint32_t i = 0; i < 4; i++) {
         ds4_gpu_tensor_free(g->compressed[i]);
         ds4_gpu_tensor_free(g->index_cache[i]);
@@ -40396,13 +40406,24 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     g->table[0].fd = g->table[1].fd = -1;
 }
 
+/* DS4_V41_RAW_LOG_ROWS=<rows> sizes the rewind ring (0 disables it); the
+ * default keeps the last 8192 positions, 640 MiB over 40 layers. */
+static uint32_t ds41_raw_log_rows(uint32_t ctx) {
+    const char *env = getenv("DS4_V41_RAW_LOG_ROWS");
+    long rows = env && env[0] ? strtol(env, NULL, 10) : 8192;
+    if (rows < 0) rows = 0;
+    if (rows != 0 && rows < 256) rows = 256;
+    if ((uint64_t)rows > ctx) rows = ctx;
+    return (uint32_t)rows;
+}
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
         .carry_cap = ds41_carry_cap(ctx),
         .prefill_alias = !getenv("DS4_METAL_DISABLE_V41_PREFILL_ALIAS"),
         .compact_carry = !getenv("DS4_METAL_DISABLE_V41_COMPACT_CARRY")}, *g = &shape;
-    uint64_t floats = (uint64_t)40 * 128 * 512;
+    uint64_t floats = (uint64_t)40 * (128 + ds41_raw_log_rows(ctx)) * 512;
     for (uint32_t i = 0; i < 4; i++)
         floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
@@ -40444,7 +40465,7 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
 static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
     ds4_context_memory m = {.prefill_cap = ds41_prefill_limit(ctx),
                            .raw_cap = 128, .comp_cap = ctx + 1u};
-    m.raw_bytes = 40u * 128u * 512u * sizeof(float);
+    m.raw_bytes = (uint64_t)40u * (128u + ds41_raw_log_rows(ctx)) * 512u * sizeof(float);
     for (uint32_t i = 0; i < 4; i++)
         m.compressed_bytes += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) *
                               (512u + 128u) * sizeof(float);
@@ -40456,6 +40477,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
+    g->raw_log_from = 0;
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
@@ -40521,6 +40543,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 40; i++) {
         g->window[i] = ds4_gpu_tensor_alloc(128u * 512u * sizeof(float));
         if (!g->window[i]) goto fail;
+    }
+    g->raw_log_rows = ds41_raw_log_rows(ctx);
+    for (uint32_t i = 0; g->raw_log_rows && i < 40; i++) {
+        g->raw_log[i] = ds4_gpu_tensor_alloc((uint64_t)g->raw_log_rows * 512u * sizeof(float));
+        if (!g->raw_log[i]) goto fail;
     }
     for (uint32_t i = 0; i < 4; i++) {
         const uint64_t cap = ctx / (i < 3 ? 2u : 1u) + 1u;
@@ -40955,6 +40982,61 @@ static bool ds41_attention_project(ds41_gpu_graph *g, const ds4_model *m,
         ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm);
 }
 
+/* Copy `count` raw rows for positions first_pos.. from src rows src_row..
+ * into the rewind ring, in at most two pieces around its wrap. */
+static bool ds41_raw_log_write(ds41_gpu_graph *g, uint32_t il, const ds4_gpu_tensor *src,
+                               uint32_t src_row, uint32_t first_pos, uint32_t count) {
+    const uint32_t rows = g->raw_log_rows;
+    if (!rows || !count) return true;
+    const uint64_t rb = 512u * sizeof(float);
+    if (count > rows) {
+        src_row += count - rows;
+        first_pos += count - rows;
+        count = rows;
+    }
+    const uint32_t slot = first_pos % rows;
+    const uint32_t part = count < rows - slot ? count : rows - slot;
+    return ds4_gpu_tensor_copy(g->raw_log[il], (uint64_t)slot * rb, src,
+                               (uint64_t)src_row * rb, (uint64_t)part * rb) &&
+        (part == count || ds4_gpu_tensor_copy(g->raw_log[il], 0, src,
+                               (uint64_t)(src_row + part) * rb, (uint64_t)(count - part) * rb));
+}
+
+/* Drop the graph back to an even position. The compressed and index caches
+ * are addressed by valid length, so the rows past `pos` are simply never read
+ * again, and the odd-row pair state is rewritten by the next even token; the
+ * decode windows are rebuilt from the rewind ring, which must still hold the
+ * rows before `pos`. `tokens` is the session's full token history. */
+static bool ds41_graph_rewind(ds41_gpu_graph *g, const int *tokens, uint32_t pos) {
+    if (!g->valid || pos > g->pos || (pos & 1u)) return false;
+    if (pos < g->pos) {
+        const uint32_t need = pos < 128u ? pos : 128u;
+        const uint32_t from = pos - need;
+        if (need && (!g->raw_log_rows || from < g->raw_log_from ||
+                     g->pos - from >= g->raw_log_rows)) return false;
+        const uint64_t rb = 512u * sizeof(float);
+        bool ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t il = 0; ok && il < 40 && need; il++) {
+            for (uint32_t q = from; ok && q < pos;) {
+                const uint32_t ls = q % g->raw_log_rows, ws = q % 128u;
+                uint32_t n = pos - q;
+                if (n > g->raw_log_rows - ls) n = g->raw_log_rows - ls;
+                if (n > 128u - ws) n = 128u - ws;
+                ok = ds4_gpu_tensor_copy(g->window[il], (uint64_t)ws * rb,
+                                         g->raw_log[il], (uint64_t)ls * rb, (uint64_t)n * rb);
+                q += n;
+            }
+        }
+        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        if (!ok) return false;
+    }
+    g->pos = pos;
+    ds4_engram_history_reset(&g->history);
+    for (uint32_t i = 0; i < 3 && i < pos; i++)
+        g->history.tail[i] = (int32_t)g->token_map[tokens[pos - 1u - i]];
+    return true;
+}
+
 static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
                            const ds4_layer_weights *l, uint32_t il, bool projected) {
     const uint32_t pos = g->pos, ratio = ds4_layer_compress_ratio(il);
@@ -40968,6 +41050,7 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
                              g->kv, 0, 512u * 4u) ||
+        !ds41_raw_log_write(g, il, g->kv, 0, pos, 1) ||
         !ds41_attention_select(g, m, l, il)) return false;
     const uint32_t attended = n_comp < DS4_N_INDEXER_TOP_K ? n_comp : DS4_N_INDEXER_TOP_K;
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
@@ -41464,6 +41547,7 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t kept = n_raw < 128u ? n_raw : 128u;
     const uint32_t slot = (start + count - kept) % 128u;
     const uint32_t part = kept < 128u - slot ? kept : 128u - slot;
+    if (!ds41_raw_log_write(g, il, g->raw_prefill, previous, start, count)) return false;
     return ds4_gpu_tensor_copy(g->window[il], slot * row_bytes, g->raw_prefill,
             (n_raw - kept) * row_bytes, part * row_bytes) &&
         (kept == part || ds4_gpu_tensor_copy(g->window[il], 0, g->raw_prefill,
@@ -41647,7 +41731,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
+#ifdef __APPLE__
+        if (!ds4_engram_read_batch(&g->table[i], ids[i], 1, DS4_ENGRAM_COLS, g->rows[i]))
+            return false;
+#else
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
+#endif
     }
     const float initial_pre[] = {1, 0, 0, 0};
     if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
@@ -41988,7 +42077,8 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
                         ds4_gpu_dsv41_quantize(row.kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0);
                 if (ok) ok = ds4_gpu_tensor_copy(g->window[il],
                     (uint64_t)(row.pos % 128u) * DS4_N_HEAD_DIM * sizeof(float),
-                    row.kv, 0, DS4_N_HEAD_DIM * sizeof(float));
+                    row.kv, 0, DS4_N_HEAD_DIM * sizeof(float)) &&
+                    ds41_raw_log_write(g, il, row.kv, 0, row.pos, 1);
             }
         }
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42224,6 +42314,11 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
         return false;
     const uint32_t initial_start = g->pos;
+    /* With the decoder suffix, layers 20-39 compute only a shrinking tail of
+     * this sweep -- layer 39 just its last 128 rows -- so the rewind ring holds
+     * no raw rows of theirs before that.  Rewinds may not land inside it. */
+    if (decoder_suffix && initial_start + total_count - 128u > g->raw_log_from)
+        g->raw_log_from = initial_start + total_count - 128u;
     g->valid = false;
     ds41_gpu_graph row = *g;
     /* The complete current layer is mapped for prefill. Refresh the bounded
@@ -45521,7 +45616,7 @@ static double glm_graph_bytes_to_gib(uint64_t bytes) {
     return (double)bytes / (1024.0 * 1024.0 * 1024.0);
 }
 
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
 static uint64_t g_glm_rocm_guard_available_baseline;
 #endif
 
@@ -56315,6 +56410,13 @@ static bool glm_graph_forward_token(
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* Number of leading selected slots that are known to index live cache rows.
+     * 0 means "all of them are" -- the producers that fill a contiguous range or
+     * a plain top-k.  The GLM-5.3 pooled expansion instead guarantees only
+     * [0, indexer_top_k) and pads the causal-tail slots above it with
+     * 0xffffffff, so it must never be handed to a kernel level that assumes
+     * every row is valid. */
+    uint32_t last_indexer_guaranteed_prefix = 0;
 #define DS4_GLM_PROFILE_DECODE_STAGE(part_, name_) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos, 1, &decode_stage_t0); \
@@ -56644,12 +56746,14 @@ static bool glm_graph_forward_token(
                     }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_fill");
                     last_indexer_selected_count = visible;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok && (decode_ablate & DS4_GLM_ABLATE_INDEXER)) {
                     /* Ablation: valid selected ids without the score/topk
                      * chain, so downstream attention timing stays real. */
                     ok = ds4_gpu_glm_fill_selected_range_tensor(g->indexer_selected,
                                                                 indexer_top_k) != 0;
                     last_indexer_selected_count = indexer_top_k;
+                    last_indexer_guaranteed_prefix = 0;   /* contiguous range */
                 } else if (ok) {
                     ok = g->glm53 ?
                         glm53_graph_matmul(
@@ -56756,6 +56860,8 @@ static bool glm_graph_forward_token(
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_topk");
                     last_indexer_selected_count = g->glm53 ?
                         glm53_graph_indexer_selected_limit() : indexer_top_k;
+                    /* the pooled expansion pads slots >= indexer_top_k */
+                    last_indexer_guaranteed_prefix = g->glm53 ? indexer_top_k : 0;
                 }
                 if (ok) last_indexer_selected = g->indexer_selected;
             } else if (ok && (!last_indexer_selected || last_indexer_selected_count == 0)) {
@@ -56826,7 +56932,7 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    true,
+                                                                                    last_indexer_guaranteed_prefix == 0u,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,
@@ -63082,6 +63188,7 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
             for (uint32_t i = 0; i < 3 && i < pos; i++)
                 g->history.tail[i] = (int32_t)g->token_map[tokens.v[pos - 1u - i]];
             g->pos = pos;
+            g->raw_log_from = pos;
             ds4_tokens_copy(&s->checkpoint, &tokens);
             s->checkpoint_valid = true;
         }
@@ -75960,6 +76067,23 @@ bool ds4_session_vision_state_matches(
            ds4_session_vision_prefix_matches(s, images, image_count);
 }
 
+bool ds4_session_vision_fingerprint_prefix_matches(
+        const ds4_session     *s,
+        const ds4_vision_span *images,
+        size_t                 image_count) {
+    if (!s || !s->checkpoint_valid) return false;
+    if ((image_count != 0 && !images)) return false;
+    if (s->checkpoint_image_count > image_count) return false;
+    for (size_t i = 0; i < s->checkpoint_image_count; i++) {
+        const ds4_vision_identity *old = &s->checkpoint_images[i];
+        const ds4_vision_span *current = &images[i];
+        if (old->token_count != current->embedding.token_count ||
+            memcmp(old->fingerprint, current->embedding.fingerprint,
+                   sizeof(old->fingerprint)) != 0) return false;
+    }
+    return true;
+}
+
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
     if (!s || !s->checkpoint_valid || (image_count && !images) ||
@@ -86206,6 +86330,25 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_DEEPSEEK41_GPU)
+    /* ds41_graph_rewind only lands on even positions.  For an odd target,
+     * rewind to the even position below and replay the one kept token: one
+     * decode step, where invalidating would make the caller rebuild the whole
+     * prefix from token 0. */
+    if ((pos & 1) && s->checkpoint_valid && ds4_session_is_ds41(s) &&
+        s->ds41_graph_ready && s->checkpoint_image_count == 0) {
+        const int keep = s->checkpoint.v[pos - 1];
+        ds4_session_rewind(s, pos - 1);
+        if (s->checkpoint_valid) {
+            char e[160];
+            if (ds4_session_eval(s, keep, e, sizeof(e)) != 0 ||
+                s->checkpoint.len != pos) {
+                s->checkpoint_valid = false;
+            }
+        }
+        return;
+    }
+#endif
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos))
@@ -86248,6 +86391,14 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (s->checkpoint_valid && ds4_session_is_glm(s)) {
         state_ok = !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind(s, pos);
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    /* Text-only: the rebuilt Engram history (and an odd target's replayed
+     * token) would treat image positions as text. */
+    if (s->checkpoint_valid && ds4_session_is_ds41(s) && s->ds41_graph_ready &&
+        s->checkpoint_image_count == 0 &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len && ds4_gpu_synchronize())
+        state_ok = ds41_graph_rewind(&s->ds41_graph, s->checkpoint.v, (uint32_t)pos);
+#endif
 #endif
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
@@ -86264,6 +86415,56 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 
 int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
+}
+
+bool ds4_session_checkpoint_valid(const ds4_session *s) {
+    return s && s->checkpoint_valid;
+}
+
+void ds4_test_use_deepseek41_shape(int on) {
+    static ds4_shape saved;
+    static bool active;
+    if (on && !active) {
+        saved = g_ds4_shape;
+        g_ds4_shape = DS4_SHAPE_FLASH41;
+        active = true;
+    } else if (!on && active) {
+        g_ds4_shape = saved;
+        active = false;
+    }
+}
+
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n) {
+    ds4_session *s = xcalloc(1, sizeof(*s));
+    for (int i = 0; i < n; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    s->checkpoint_valid = true;
+    return s;
+}
+
+void ds4_session_free_test_checkpoint(ds4_session *s) {
+    if (!s) return;
+    token_vec_free(&s->checkpoint);
+    free(s->checkpoint_images);
+    free(s);
+}
+
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n) {
+    if (!s) return;
+    free(s->checkpoint_images);
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    if (n == 0 || !images) return;
+    s->checkpoint_images = xcalloc(n, sizeof(*s->checkpoint_images));
+    for (size_t i = 0; i < n; i++) {
+        s->checkpoint_images[i].token_start = images[i].token_start;
+        s->checkpoint_images[i].token_count =
+            images[i].embedding.token_count;
+        memcpy(s->checkpoint_images[i].fingerprint,
+               images[i].embedding.fingerprint,
+               sizeof(s->checkpoint_images[i].fingerprint));
+    }
+    s->checkpoint_image_count = n;
 }
 
 int ds4_session_ctx(ds4_session *s) {
