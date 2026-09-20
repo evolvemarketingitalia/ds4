@@ -5027,8 +5027,19 @@ static int cuda_stream_selected_apply_split(
                                               down_expert_bytes)) {
         return 0;
     }
-    if ((g_stream_selected_pending.resident_mask |
-         g_stream_selected_pending.missing_mask) == 0 ||
+    /* The split launches one kernel per mask and each kernel returns early on
+     * the slots outside its mask, so a slot covered by neither would keep the
+     * previous token's mid value: the result would depend on how the experts
+     * happened to divide between resident and missing.  Require exact
+     * coverage of every selected slot and fall back to the compact table
+     * otherwise. */
+    const uint32_t split_covered = g_stream_selected_pending.resident_mask |
+                                   g_stream_selected_pending.missing_mask;
+    const uint32_t split_full = n_selected >= 32u ?
+        0xffffffffu : ((1u << n_selected) - 1u);
+    if (split_covered != split_full ||
+        (g_stream_selected_pending.resident_mask &
+         g_stream_selected_pending.missing_mask) != 0 ||
         !g_stream_selected_cache.gate_ptrs ||
         !g_stream_selected_cache.up_ptrs ||
         !g_stream_selected_cache.down_ptrs) {
