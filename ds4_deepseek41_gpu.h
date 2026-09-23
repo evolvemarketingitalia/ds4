@@ -167,6 +167,7 @@ int ds4_gpu_dsv41_hc_project(ds4_gpu_dsv41_hc_plan **plan,
 void ds4_gpu_dsv41_hc_plan_free(ds4_gpu_dsv41_hc_plan *plan);
 
 /* Preserve V4.1 activation formats while applying Q8 weights. */
+int ds4_gpu_dsv41_attention_output_rounded(void);
 int ds4_gpu_dsv41_q8_projection_rows_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                           uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                           uint32_t rows, const ds4_gpu_tensor *in);
