@@ -1025,7 +1025,8 @@ extern "C" int ds4_gpu_hc_rms_scale_project_f16_tensor(ds4_gpu_tensor *out, ds4_
 /* Four input values per lane, four Q8 blocks per wave. Scalar V4.1
  * projections retain F32 activations; the block-wise reduction differs from
  * the original lane accumulation and is qualified independently. */
-__global__ static void v41_q8_f32_blocks4_kernel(float *out,
+template <bool ROUND_BF16>
+__global__ static void v41_q8_f32_blocks4_kernel_t(float *out,
         const unsigned char *weights, const float *input,
         uint32_t width, uint32_t outputs, uint64_t row_bytes) {
     const uint32_t lane = threadIdx.x & 31u;
@@ -1044,8 +1045,11 @@ __global__ static void v41_q8_f32_blocks4_kernel(float *out,
         acc += d * value;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0u) out[row] = acc;
+    if (lane == 0u) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
 }
+
+/* Halo: the epilogue rounding replaces a separate v41_bf16_kernel launch per projection. */
+#define v41_q8_f32_blocks4_kernel v41_q8_f32_blocks4_kernel_t<false>
 
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
@@ -1092,6 +1096,55 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
             (float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows, width / 32u);
     }
     return cuda_ok(cudaGetLastError(), "V4.1 F32-input Q8 projection");
+}
+
+__global__ static void v41_rms_norm_weight_bf16_kernel(float *out, const float *x, const float *w, uint32_t n, float eps) {
+    const float *xr = x;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) { float v = xr[i]; sum += v * v; }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float scale = rsqrtf(partial[0] / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) out[i] = v41_bf16(xr[i] * scale * w[i]);
+}
+
+extern "C" int ds4_gpu_dsv41_rms_norm_weight_bf16_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
+    uint64_t weight_bytes = 0;
+    if (!model_map || !cuda_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_f32(out, n) || !cuda_tensor_has_f32(x, n)) return 0;
+    if (n == 0u) return 1;
+    const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "rms_weight");
+    if (!wptr) return 0;
+    v41_rms_norm_weight_bf16_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, (const float *)wptr, n, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 rms_norm bf16 launch");
+}
+
+extern "C" int ds4_gpu_dsv41_q8_projection_rows_bf16(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                                uint64_t weight_offset, uint32_t width, uint32_t outputs,
+                                                uint32_t rows, const ds4_gpu_tensor *in) {
+    uint64_t weight_bytes = 0;
+    if (!width || width % 32u || !outputs || !rows || rows > 8192u || !model_map ||
+        !cuda_u64_mul3_checked(width / 32u, outputs, 34u, &weight_bytes) ||
+        !cuda_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !cuda_tensor_has_elems2(in, width, rows, 4u) || !cuda_tensor_has_elems2(out, outputs, rows, 4u)) return 0;
+    const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
+        model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
+    if (!weights) return 0;
+    if (rows == 1u && ds4_rocm_is_gfx1151()) {
+        v41_q8_f32_blocks4_kernel_t<true><<<(outputs + 7u) / 8u, 256u>>>(
+            (float *)out->ptr, weights, (const float *)in->ptr,
+            width, outputs, (uint64_t)(width / 32u) * 34u);
+    } else {
+        if (!ds4_gpu_dsv41_q8_projection_rows(out, model_map, model_size, weight_offset, width, outputs, rows, in)) return 0;
+        return ds4_gpu_dsv41_quantize(out, outputs, rows, DS4_V41_BF16);
+    }
+    return cuda_ok(cudaGetLastError(), "V4.1 Q8 projection (bf16 epilogue) launch");
 }
 
 /* V4.1 grouped output-A: retain physical token strides while using the
