@@ -13,6 +13,22 @@ static int g_ssd_streaming_mode;
 static cudaStream_t g_model_upload_stream;
 static cudaStream_t g_stream_selected_upload_stream;
 static cudaStream_t g_selected_readback_stream;
+
+/* Debug bisect for the pointer-path race: DS4_ROCM_SPLIT_DEBUG_SYNC bitmask
+ * inserts a device-wide sync at chosen points (1 = after pointer-table
+ * uploads, 4 = start of apply_split, 8 = start of selected_load,
+ * 16 = after the split gate/up kernels, 32 = end of finish_pending_missing). */
+static int cuda_split_debug_sync_mask(void) {
+    static int mask = -1;
+    if (mask < 0) {
+        const char *e = getenv("DS4_ROCM_SPLIT_DEBUG_SYNC");
+        mask = (e && e[0]) ? atoi(e) : 0;
+    }
+    return mask;
+}
+static void cuda_split_debug_sync(int bit) {
+    if (cuda_split_debug_sync_mask() & bit) (void)cudaDeviceSynchronize();
+}
 static cudaEvent_t g_selected_readback_event;
 static uint64_t g_selected_readback_event_value;
 static cublasHandle_t g_cublas;
@@ -94,6 +110,12 @@ struct cuda_q8_f16_transpose_range {
     __half *device_ptr;
 };
 
+/* Pinned host staging slots for the per-layer expert pointer tables.  The
+ * pointer path lets the host run ahead of the compute stream, so one staging
+ * buffer would be overwritten by the next layer while the previous upload is
+ * still queued; each ring slot is reused only after its own upload event. */
+#define DS4_ROCM_PTRS_STAGE_RING 64u
+
 struct cuda_stream_selected_cache {
     int loaded;
     const void *model_map;
@@ -112,9 +134,13 @@ struct cuda_stream_selected_cache {
     const char **gate_ptrs;
     const char **up_ptrs;
     const char **down_ptrs;
-    const char **gate_ptrs_stage;
+    const char **gate_ptrs_stage;   /* views into ptrs_stage_ring (current slot) */
     const char **up_ptrs_stage;
     const char **down_ptrs_stage;
+    const char **ptrs_stage_ring;   /* pinned: RING * 3 * DS4_ROCM_N_EXPERT_USED */
+    cudaEvent_t ptrs_stage_events[DS4_ROCM_PTRS_STAGE_RING];
+    uint8_t ptrs_stage_pending[DS4_ROCM_PTRS_STAGE_RING];
+    uint32_t ptrs_stage_cursor;
     ds4_gpu_tensor slot_tensor;
 };
 
@@ -1110,15 +1136,21 @@ static int cuda_stream_batch_selected_mark_inflight(void) {
 }
 
 static void cuda_stream_selected_stage_release(void) {
-    if (g_stream_selected_cache.gate_ptrs_stage) {
-        (void)cudaFreeHost((void *)g_stream_selected_cache.gate_ptrs_stage);
+    for (uint32_t i = 0; i < DS4_ROCM_PTRS_STAGE_RING; i++) {
+        if (g_stream_selected_cache.ptrs_stage_events[i]) {
+            if (g_stream_selected_cache.ptrs_stage_pending[i]) {
+                (void)cudaEventSynchronize(g_stream_selected_cache.ptrs_stage_events[i]);
+            }
+            (void)cudaEventDestroy(g_stream_selected_cache.ptrs_stage_events[i]);
+            g_stream_selected_cache.ptrs_stage_events[i] = NULL;
+        }
+        g_stream_selected_cache.ptrs_stage_pending[i] = 0;
     }
-    if (g_stream_selected_cache.up_ptrs_stage) {
-        (void)cudaFreeHost((void *)g_stream_selected_cache.up_ptrs_stage);
+    if (g_stream_selected_cache.ptrs_stage_ring) {
+        (void)cudaFreeHost((void *)g_stream_selected_cache.ptrs_stage_ring);
     }
-    if (g_stream_selected_cache.down_ptrs_stage) {
-        (void)cudaFreeHost((void *)g_stream_selected_cache.down_ptrs_stage);
-    }
+    g_stream_selected_cache.ptrs_stage_ring = NULL;
+    g_stream_selected_cache.ptrs_stage_cursor = 0;
     g_stream_selected_cache.gate_ptrs_stage = NULL;
     g_stream_selected_cache.up_ptrs_stage = NULL;
     g_stream_selected_cache.down_ptrs_stage = NULL;
@@ -1208,22 +1240,29 @@ static int cuda_stream_selected_ensure_buffers(uint64_t gate_bytes, uint64_t dow
             return 0;
         }
     }
-    if (!g_stream_selected_cache.gate_ptrs_stage) {
+    if (!g_stream_selected_cache.ptrs_stage_ring) {
         void *stage = NULL;
-        err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
-        g_stream_selected_cache.gate_ptrs_stage =
-            err == cudaSuccess ? (const char **)stage : NULL;
-        stage = NULL;
+        err = cudaMallocHost(&stage,
+                             (size_t)DS4_ROCM_PTRS_STAGE_RING * 3u *
+                                 DS4_ROCM_N_EXPERT_USED * sizeof(char *));
         if (err == cudaSuccess) {
-            err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
-            g_stream_selected_cache.up_ptrs_stage =
-                err == cudaSuccess ? (const char **)stage : NULL;
-            stage = NULL;
+            g_stream_selected_cache.ptrs_stage_ring = (const char **)stage;
+            memset(g_stream_selected_cache.ptrs_stage_events, 0,
+                   sizeof(g_stream_selected_cache.ptrs_stage_events));
+            memset(g_stream_selected_cache.ptrs_stage_pending, 0,
+                   sizeof(g_stream_selected_cache.ptrs_stage_pending));
+            g_stream_selected_cache.ptrs_stage_cursor = 0;
+            for (uint32_t i = 0; i < DS4_ROCM_PTRS_STAGE_RING && err == cudaSuccess; i++) {
+                err = cudaEventCreateWithFlags(&g_stream_selected_cache.ptrs_stage_events[i],
+                                               cudaEventDisableTiming);
+            }
         }
         if (err == cudaSuccess) {
-            err = cudaMallocHost(&stage, DS4_ROCM_N_EXPERT_USED * sizeof(char *));
+            g_stream_selected_cache.gate_ptrs_stage = g_stream_selected_cache.ptrs_stage_ring;
+            g_stream_selected_cache.up_ptrs_stage =
+                g_stream_selected_cache.ptrs_stage_ring + DS4_ROCM_N_EXPERT_USED;
             g_stream_selected_cache.down_ptrs_stage =
-                err == cudaSuccess ? (const char **)stage : NULL;
+                g_stream_selected_cache.ptrs_stage_ring + 2u * DS4_ROCM_N_EXPERT_USED;
         }
         if (err != cudaSuccess) {
             fprintf(stderr,
@@ -2028,6 +2067,18 @@ static int cuda_stream_read_profile_enabled(void) {
     return g_stream_read_profile_enabled;
 }
 
+static int g_stream_keep_file_pages = -1;
+/* DS4_ROCM_STREAM_KEEP_PAGES=1: with buffered (non-direct) expert reads, leave
+ * the file pages in the OS page cache instead of dropping them after each job,
+ * so free RAM acts as a second-level expert cache behind the resident one. */
+static int cuda_stream_keep_file_pages(void) {
+    if (g_stream_keep_file_pages < 0) {
+        const char *env = getenv("DS4_ROCM_STREAM_KEEP_PAGES");
+        g_stream_keep_file_pages =
+            (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return g_stream_keep_file_pages;
+}
 static int cuda_stream_read_direct_disabled(void) {
     if (g_stream_read_direct_disabled < 0) {
         const char *env = getenv("DS4_ROCM_STREAM_NO_DIRECT");
@@ -2136,7 +2187,7 @@ static int cuda_stream_read_job_upload(
         return 0;
     }
     job->uploaded = 1;
-    if (!job->direct) cuda_model_drop_file_pages(job->offset, job->bytes);
+    if (!job->direct && !cuda_stream_keep_file_pages()) cuda_model_drop_file_pages(job->offset, job->bytes);
     return 1;
 }
 
@@ -2612,7 +2663,7 @@ static int cuda_stream_selected_upload_read_jobs(
             return 0;
         }
         if (!jobs[i].direct) {
-            cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
+            if (!cuda_stream_keep_file_pages()) cuda_model_drop_file_pages(jobs[i].offset, jobs[i].bytes);
         }
     }
     cudaError_t err = cudaStreamSynchronize(g_stream_selected_upload_stream);
@@ -3645,11 +3696,30 @@ static int cuda_stream_selected_prepare_ptrs(
         up_ptrs[i] = entry.up;
         down_ptrs[i] = entry.down;
     }
-    if (!g_stream_selected_cache.gate_ptrs_stage ||
-        !g_stream_selected_cache.up_ptrs_stage ||
-        !g_stream_selected_cache.down_ptrs_stage) {
-        return 0;
+    if (!g_stream_selected_cache.ptrs_stage_ring) return 0;
+    /* Pick the next pinned staging slot and make sure its previous upload has
+     * been consumed before overwriting it (a no-op once the ring is deeper
+     * than the host's run-ahead). */
+    const uint32_t ring_slot = g_stream_selected_cache.ptrs_stage_cursor;
+    g_stream_selected_cache.ptrs_stage_cursor =
+        (ring_slot + 1u) % DS4_ROCM_PTRS_STAGE_RING;
+    if (g_stream_selected_cache.ptrs_stage_pending[ring_slot]) {
+        cudaError_t werr =
+            cudaEventSynchronize(g_stream_selected_cache.ptrs_stage_events[ring_slot]);
+        if (werr != cudaSuccess) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX "streaming selected pointer staging wait failed: %s\n",
+                    cudaGetErrorString(werr));
+            (void)cudaGetLastError();
+            return 0;
+        }
+        g_stream_selected_cache.ptrs_stage_pending[ring_slot] = 0;
     }
+    const char **ring_base = g_stream_selected_cache.ptrs_stage_ring +
+                             (size_t)ring_slot * 3u * DS4_ROCM_N_EXPERT_USED;
+    g_stream_selected_cache.gate_ptrs_stage = ring_base;
+    g_stream_selected_cache.up_ptrs_stage = ring_base + DS4_ROCM_N_EXPERT_USED;
+    g_stream_selected_cache.down_ptrs_stage = ring_base + 2u * DS4_ROCM_N_EXPERT_USED;
     const size_t ptr_bytes = n_selected * sizeof(gate_ptrs[0]);
     memcpy((void *)g_stream_selected_cache.gate_ptrs_stage,
            gate_ptrs,
@@ -3660,25 +3730,38 @@ static int cuda_stream_selected_prepare_ptrs(
     memcpy((void *)g_stream_selected_cache.down_ptrs_stage,
            down_ptrs,
            ptr_bytes);
+    /* The pointer tables are consumed by kernels on the compute stream and
+     * overwritten again by the next layer's prepare while those kernels may
+     * still be queued.  Issue the three small uploads on the compute stream
+     * itself so they are ordered after the previous layer's MoE kernels and
+     * before this layer's, without relying on the upload-stream event.
+     * (Serializing copies made the pointer path deterministic; this is the
+     * same ordering expressed in-stream.) */
     cudaError_t err = cudaMemcpyAsync(g_stream_selected_cache.gate_ptrs,
                                       g_stream_selected_cache.gate_ptrs_stage,
                                       ptr_bytes,
                                       cudaMemcpyHostToDevice,
-                                      g_stream_selected_upload_stream);
+                                      0);
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(g_stream_selected_cache.up_ptrs,
                               g_stream_selected_cache.up_ptrs_stage,
                               ptr_bytes,
                               cudaMemcpyHostToDevice,
-                              g_stream_selected_upload_stream);
+                              0);
     }
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(g_stream_selected_cache.down_ptrs,
                               g_stream_selected_cache.down_ptrs_stage,
                               ptr_bytes,
                               cudaMemcpyHostToDevice,
-                              g_stream_selected_upload_stream);
+                              0);
     }
+    if (err == cudaSuccess) {
+        /* Slot reusable only once the compute stream has consumed it. */
+        err = cudaEventRecord(g_stream_selected_cache.ptrs_stage_events[ring_slot], 0);
+        if (err == cudaSuccess) g_stream_selected_cache.ptrs_stage_pending[ring_slot] = 1;
+    }
+    cuda_split_debug_sync(1);
     int upload_record_ok = 1;
     if (err == cudaSuccess) {
         upload_record_ok = cuda_stream_selected_upload_record_ready();
@@ -4638,6 +4721,7 @@ static int cuda_stream_selected_load(
         uint64_t down_offset,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
+    cuda_split_debug_sync(8);
     g_stream_selected_cache.loaded = 0;
     if (g_stream_selected_pending.active) {
         cuda_stream_selected_abort_pending();
@@ -5009,6 +5093,7 @@ static int cuda_stream_selected_apply_split(
         const char ***down_ptrs,
         uint32_t *resident_mask,
         uint32_t *missing_mask) {
+    cuda_split_debug_sync(4);
     if (!g_ssd_streaming_mode ||
         !selected_exec ||
         !gate_w ||
@@ -5093,6 +5178,7 @@ static int cuda_stream_selected_finish_pending_missing(uint32_t compact_mask) {
     }
     g_stream_selected_cache.loaded = compact_mask != 0 ? 1 : 0;
     memset(&g_stream_selected_pending, 0, sizeof(g_stream_selected_pending));
+    cuda_split_debug_sync(32 | (compact_mask != 0 ? 128 : 64));
     return 1;
 }
 

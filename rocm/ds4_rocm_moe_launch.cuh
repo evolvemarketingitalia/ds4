@@ -81,9 +81,25 @@ static void routed_moe_decode_profile_print(void) {
  * Off by default: it is faster but not yet bit-reproducible (see the split
  * site).  DS4_ROCM_SELECTED_SPLIT_DRAIN=0 removes the stream drain that
  * separates the resident kernels from the miss upload. */
-static int routed_moe_selected_split_enabled(void) {
+/* DS4_ROCM_SELECTED_SPLIT: 0/unset = compact table (default); 1 = two-phase
+ * resident/missing split (non-deterministic across runs, kept for experiments);
+ * 2 = single-phase pointer path only for layers whose selected experts are all
+ * resident (no compaction copies, deterministic), compact table otherwise. */
+/* DS4_ROCM_SPLIT_COMPACT_WAIT=0 disables the upload-stream wait after the
+ * split-mode compaction (diagnostic only). */
+static int routed_moe_split_compact_wait_enabled(void) {
+    const char *env = getenv("DS4_ROCM_SPLIT_COMPACT_WAIT");
+    return !(env && env[0] == '0');
+}
+
+static int routed_moe_selected_split_mode(void) {
     const char *env = getenv("DS4_ROCM_SELECTED_SPLIT");
-    return env != NULL && env[0] != '0';
+    if (env == NULL || env[0] == '\0' || env[0] == '0') return 0;
+    return env[0] == '2' ? 2 : 1;
+}
+
+static int routed_moe_selected_split_enabled(void) {
+    return routed_moe_selected_split_mode() != 0;
 }
 
 static int routed_moe_selected_split_drain(void) {
@@ -1335,7 +1351,16 @@ static int routed_moe_launch(
                 !q4k_path &&
                 !sorted_pairs &&
                 stream_resident_mask != 0 &&
-                stream_missing_mask != 0;
+                (stream_missing_mask == 0 ? 1 : routed_moe_selected_split_mode() == 1);
+            const int split_single_phase = split_supported && stream_missing_mask == 0;
+            if (split_single_phase) {
+                static int logged_single_phase = 0;
+                if (!logged_single_phase) {
+                    logged_single_phase = 1;
+                    fprintf(stderr, DS4_GPU_LOG_PREFIX
+                            "SSD streaming routed MoE single-phase pointer path for all-resident layers\n");
+                }
+            }
             if (split_supported) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
                 if (use_v41_wave_gate) {
@@ -1380,6 +1405,7 @@ static int routed_moe_launch(
                         clamp);
                 }
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split resident gate/up launch");
+                cuda_split_debug_sync(16);
                 /* The upload below writes expert slots from its own stream
                  * while these kernels still read theirs.  Mark them in flight
                  * so any slot reuse waits, and drain the default stream so no
@@ -1387,6 +1413,17 @@ static int routed_moe_launch(
                  * reading.  The SSD reads keep running during the drain, which
                  * is where the overlap comes from. */
                 if (ok) ok = cuda_stream_selected_mark_inflight();
+                if (split_single_phase) {
+                    /* Every selected expert is resident: the resident-mask
+                     * launch above covered all slots.  Clear the pending state
+                     * and skip the drain and the missing-mask launch. */
+                    if (!ok) {
+                        (void)cuda_stream_selected_finish_pending_missing(0);
+                    } else {
+                        ok = cuda_stream_selected_finish_pending_missing(0);
+                    }
+                    split_gateup_done = ok;
+                } else {
                 if (ok && routed_moe_selected_split_drain()) {
                     ok = cuda_ok(cudaStreamSynchronize(0),
                                  "routed_moe split resident drain");
@@ -1439,9 +1476,17 @@ static int routed_moe_launch(
                 }
                 if (ok) ok = cuda_ok(cudaGetLastError(), "routed_moe split missing gate/up launch");
                 split_gateup_done = ok;
+                }
             } else {
                 ok = cuda_stream_selected_finish_pending_missing(
                         stream_resident_mask | stream_missing_mask);
+                /* The compaction above copies expert slots into the compact
+                 * table on the upload stream; the generic kernels launched
+                 * below read that table on the compute stream, so order them
+                 * after the copies (the wait_upload_ready() near the top of
+                 * this function ran before the compaction existed). */
+                if (ok && routed_moe_split_compact_wait_enabled() &&
+                    !cuda_stream_selected_wait_upload_ready()) ok = 0;
             }
         }
         if (ok && !split_gateup_done && !mmq_gateup_done) {
