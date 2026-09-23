@@ -6748,6 +6748,15 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+__global__ static void small_copy_u128_kernel(uint4 *d, const uint4 *s, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = s[i];
+}
+__global__ static void small_copy_u8_kernel(char *d, const char *s, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) d[i] = s[i];
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -6756,6 +6765,20 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         return 0;
     }
     if (bytes == 0) return 1;
+    /* Halo: small device copies go through a kernel on the compute stream.
+     * The blit path costs a queue handoff (~0.9 ms/token of gaps around the
+     * ~290 KV/ring copies per decoded token); 16-byte aligned chunks when
+     * possible, byte copy otherwise. */
+    if (bytes <= (64u << 10) && !getenv("DS4_ROCM_DISABLE_SMALL_COPY_KERNEL")) {
+        char *d = (char *)dst->ptr + dst_offset; const char *sp = (const char *)src->ptr + src_offset;
+        if ((((uintptr_t)d | (uintptr_t)sp | (uintptr_t)bytes) & 15u) == 0u) {
+            const uint32_t n = (uint32_t)(bytes / 16u);
+            small_copy_u128_kernel<<<(n + 255u) / 256u, 256>>>((uint4 *)d, (const uint4 *)sp, n);
+        } else {
+            small_copy_u8_kernel<<<(unsigned)((bytes + 255u) / 256u), 256>>>(d, sp, (uint32_t)bytes);
+        }
+        return cuda_ok(cudaGetLastError(), "tensor copy kernel launch");
+    }
     return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                                    (const char *)src->ptr + src_offset,
                                    (size_t)bytes,

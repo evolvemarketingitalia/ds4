@@ -1258,7 +1258,8 @@ __global__ static void v41_grouped_q8_f32_wmma_rowtile_kernel(
 }
 
 /* Scalar grouped projection with packed four-weight loads and F32 activations. */
-__global__ static void v41_grouped_q8_f32_blocks4_kernel(
+template <bool ROUND_BF16>
+__global__ static void v41_grouped_q8_f32_blocks4_kernel_t(
         float *out, const unsigned char *w, const float *x, int K, int M, int G) {
     int lane = threadIdx.x & 31, row = blockIdx.x * 8 + threadIdx.x / 32;
     if (row >= M * G) return;
@@ -1273,8 +1274,12 @@ __global__ static void v41_grouped_q8_f32_blocks4_kernel(
         acc += d * v;
     }
     acc = warp_sum_f32(acc);
-    if (!lane) out[row] = acc;
+    if (!lane) out[row] = ROUND_BF16 ? v41_bf16(acc) : acc;
 }
+#define v41_grouped_q8_f32_blocks4_kernel v41_grouped_q8_f32_blocks4_kernel_t<false>
+
+static int g_v41_attn_out_rounded = 0;
+extern "C" int ds4_gpu_dsv41_attention_output_rounded(void) { return g_v41_attn_out_rounded; }
 
 extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu_tensor *low,
         const void *model_map, uint64_t model_size, uint64_t out_a_offset, uint64_t out_b_offset,
@@ -1287,8 +1292,9 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     const unsigned char *a = (const unsigned char *)cuda_model_range_ptr(model_map, out_a_offset, a_bytes, "V4.1 attn_out_a");
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map, out_b_offset, b_bytes, "V4.1 attn_out_b");
     if (!a || !b) return 0;
+    g_v41_attn_out_rounded = 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
-        v41_grouped_q8_f32_blocks4_kernel<<<1024u, 256u>>>(
+        v41_grouped_q8_f32_blocks4_kernel_t<true><<<1024u, 256u>>>(
             (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {
         /* Canonical eight groups of 4096 -> 1024, with physical F32 token
@@ -1304,10 +1310,11 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
             (const float *)heads->ptr, 4096u, 1024u, 8u, n_tokens, 128u);
     }
     if (!cuda_ok(cudaGetLastError(), "V4.1 attention low projection") ||
-        !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16)) return 0;
+        (!(n_tokens == 1u && ds4_rocm_is_gfx1151()) && !ds4_gpu_dsv41_quantize(low, 8192u, n_tokens, DS4_V41_BF16))) return 0;
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
+        g_v41_attn_out_rounded = 1;
         /* The shared input is the same BF16-rounded output-A row above. */
-        v41_q8_f32_blocks4_kernel<<<640u, 256u>>>(
+        v41_q8_f32_blocks4_kernel_t<true><<<640u, 256u>>>(
             (float *)out->ptr, b, (const float *)low->ptr,
             8192u, 5120u, UINT64_C(256) * 34u);
     } else if (!g_quality_mode && n_tokens >= 32u && n_tokens <= 2048u && ds4_rocm_is_gfx1151()) {

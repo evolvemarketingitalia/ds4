@@ -40604,12 +40604,14 @@ fail:
 #define DS41_HC_EXPAND_SPLIT_R(a,b,r,s,e,h) ds4_gpu_hc_expand_split_bf16_tensor(a,b,r,s,e,h)
 #define DS41_SWIGLU_R(o,g,u,n,cl,w)      ds4_gpu_swiglu_bf16_tensor(o,g,u,n,cl,w)
 #define DS41_BF16_AFTER(x,n)             true
+#define DS41_ATTN_HEADS_R                ds4_gpu_attention_decode_heads_bf16_tensor
 #else
 #define DS41_HC_WSUM_R(o,r,w,e,h)        ds4_gpu_hc_weighted_sum_tensor(o,r,w,e,h)
 #define DS41_HC_WSUM_SPLIT_R(o,r,w,e,h)  ds4_gpu_hc_weighted_sum_split_tensor(o,r,w,e,h)
 #define DS41_HC_EXPAND_SPLIT_R(a,b,r,s,e,h) ds4_gpu_hc_expand_split_tensor(a,b,r,s,e,h)
 #define DS41_SWIGLU_R(o,g,u,n,cl,w)      ds4_gpu_swiglu_tensor(o,g,u,n,cl,w)
 #define DS41_BF16_AFTER(x,n)             ds41_bf16(x,n)
+#define DS41_ATTN_HEADS_R                ds4_gpu_attention_decode_heads_tensor
 #endif
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
@@ -40992,17 +40994,22 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     if (n_comp && !ds4_gpu_dsv41_gather_kv(g->selected_kv, g->compressed[owner],
                                          g->selected_comp, n_comp, attended)) return false;
     const uint32_t n_raw = pos + 1u < 128u ? pos + 1u : 128u;
-    if (!ds4_gpu_attention_decode_heads_tensor(g->heads, m->map, m->size,
+    if (!DS41_ATTN_HEADS_R(g->heads, m->map, m->size,
             l->attn_sinks->abs_offset + (uint64_t)head0 * sizeof(float),
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
+        !DS41_BF16_AFTER(g->heads, heads * DS4_N_HEAD_DIM) ||
         !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
+#ifdef DS4_ROCM_BUILD
+           /* Halo: the single-node output projection rounds in its epilogue. */
+           (ds4_gpu_dsv41_attention_output_rounded() || ds41_bf16(g->block, DS4_N_EMBD));
+#else
            ds41_bf16(g->block, DS4_N_EMBD);
+#endif
 }
 
 #ifdef DS4_ROCM_BUILD
@@ -41490,8 +41497,8 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
+    return DS41_HC_EXPAND_SPLIT_R(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+        DS41_BF16_AFTER(g->residual, DS4_N_EMBD * DS4_N_HC) &&
         ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
 }
 
