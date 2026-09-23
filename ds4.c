@@ -40625,6 +40625,19 @@ fail:
 }
 #undef DS41_SCRATCH
 
+#ifdef DS4_ROCM_BUILD
+#define DS41_HC_WSUM_R(o,r,w,e,h)        ds4_gpu_hc_weighted_sum_bf16_tensor(o,r,w,e,h)
+#define DS41_HC_WSUM_SPLIT_R(o,r,w,e,h)  ds4_gpu_hc_weighted_sum_split_bf16_tensor(o,r,w,e,h)
+#define DS41_HC_EXPAND_SPLIT_R(a,b,r,s,e,h) ds4_gpu_hc_expand_split_bf16_tensor(a,b,r,s,e,h)
+#define DS41_SWIGLU_R(o,g,u,n,cl,w)      ds4_gpu_swiglu_bf16_tensor(o,g,u,n,cl,w)
+#define DS41_BF16_AFTER(x,n)             true
+#else
+#define DS41_HC_WSUM_R(o,r,w,e,h)        ds4_gpu_hc_weighted_sum_tensor(o,r,w,e,h)
+#define DS41_HC_WSUM_SPLIT_R(o,r,w,e,h)  ds4_gpu_hc_weighted_sum_split_tensor(o,r,w,e,h)
+#define DS41_HC_EXPAND_SPLIT_R(a,b,r,s,e,h) ds4_gpu_hc_expand_split_tensor(a,b,r,s,e,h)
+#define DS41_SWIGLU_R(o,g,u,n,cl,w)      ds4_gpu_swiglu_tensor(o,g,u,n,cl,w)
+#define DS41_BF16_AFTER(x,n)             ds41_bf16(x,n)
+#endif
 static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
@@ -40636,9 +40649,10 @@ static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
         const bool ok = weight->type == DS4_TENSOR_F16 ?
             ds4_gpu_dsv41_projection_rows(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in) :
-            ds4_gpu_dsv41_q8_projection_rows(out, m->map, m->size, weight->abs_offset,
+            (round ? ds4_gpu_dsv41_q8_projection_rows_bf16 : ds4_gpu_dsv41_q8_projection_rows)(out, m->map, m->size, weight->abs_offset,
                 (uint32_t)weight->dim[0], (uint32_t)weight->dim[1], 1u, in);
-        return ok && (!round || ds41_bf16(out, (uint32_t)weight->dim[1]));
+        /* Halo: the Q8 path rounds in the kernel epilogue; F16 still rounds separately. */
+        return ok && (!round || weight->type == DS4_TENSOR_Q8_0 || ds41_bf16(out, (uint32_t)weight->dim[1]));
     }
 #endif
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
@@ -40783,9 +40797,14 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+#ifdef DS4_ROCM_BUILD
+    return ds4_gpu_dsv41_rms_norm_weight_bf16_tensor(out, in, m->map, m->size,
+        weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) != 0;
+#else
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
+#endif
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -41147,9 +41166,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_here && !shared_queued &&
         (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
         !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+        !DS41_SWIGLU_R(g->shared_mid, g->shared_gate, g->shared_up,
                               DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
+        !DS41_BF16_AFTER(g->shared_mid, DS4_N_FF_EXP) ||
         !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
     bool routed_ok;
 #ifdef DS4_ROCM_BUILD
@@ -41205,8 +41224,8 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
+    bool ok = DS41_HC_WSUM_R(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+              DS41_BF16_AFTER(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
               ds41_output_projection(g, g->tp_logits_half ? g->tp_logits_half : g->logits,
                                       m, w, g->norm, 1);
     if (!ds4_gpu_end_commands()) ok = false;
@@ -41224,17 +41243,17 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
             return false;
     }
     return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+        DS41_HC_WSUM_R(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+        DS41_BF16_AFTER(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
+    return DS41_HC_EXPAND_SPLIT_R(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+        DS41_BF16_AFTER(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
         ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+        DS41_HC_WSUM_SPLIT_R(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+        DS41_BF16_AFTER(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
