@@ -42630,7 +42630,7 @@ static bool ds41_graph_prefill(ds41_gpu_graph *g, const ds4_model *m,
     return ds41_graph_prefill_sweep(g, m, w, tokens, count, progress, progress_ud,
                                    total, cancel, cancel_ud, false, false);
 }
-#if !defined(DS4_ROCM_BUILD)
+#if 1 /* ROCm: same-session row batches (DSpark verify), opt-in via DS4_ROCM_V41_SHORT_PREFILL */
 static ds41_gpu_graph *ds41_batch_workspace(ds41_gpu_graph *const *graphs, int count) {
     if (!graphs || count < 2 || count > DS4_TP_BATCH_MAX_ROWS) return NULL;
     ds41_gpu_graph *largest = NULL;
@@ -42738,6 +42738,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+#ifdef DS4_ROCM_BUILD
+        const bool batch_attn_out = g->tp_world == 1u && rows <= 8u &&
+            l->attn_output_b->type == DS4_TENSOR_Q8_0 && l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+            !getenv("DS4_ROCM_V41_ROWS_ATTN_OUT_OFF");
+#else
+        const bool batch_attn_out = false;
+#endif
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -42747,8 +42754,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l);
+                (batch_attn_out || ds41_attention_output(&row, model, l));
         }
+#ifdef DS4_ROCM_BUILD
+        /* DSpark verify rows: one output projection pass for all rows. */
+        if (ok && batch_attn_out)
+            ok = ds4_gpu_dsv41_attention_output_batch(active.block, active.low, model->map, model->size,
+                l->attn_output_a->abs_offset, l->attn_output_b->abs_offset, active.heads, rows) != 0;
+#endif
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(
@@ -76490,7 +76503,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             if (g->encoder_resident && remaining < 768u)
                 ds41_encoder_release(g, &e->model, &encoder);
 #ifdef DS4_ROCM_BUILD
-            const uint32_t short_count = 0;
+            /* Same-session row batches stay opt-in on ROCm until validated. */
+            static int rocm_short = -1;
+            if (rocm_short < 0) rocm_short = getenv("DS4_ROCM_V41_SHORT_PREFILL") ? 1 : 0;
+            const uint32_t short_count = !rocm_short || decoder_pending ? 0u :
+                ds41_short_prefill_count(g, &e->weights, remaining);
 #else
             const uint32_t short_count = decoder_pending ? 0u :
                 ds41_short_prefill_count(g, &e->weights, remaining);
@@ -76506,10 +76523,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * remainder finishes the pending decoder here, then runs normally. */
             const bool layer_major = count > 1u;
             const bool ok =
-#ifndef DS4_ROCM_BUILD
                 short_count ?
                 ds41_graph_short_prefill(g, &e->model, &e->weights, prompt->v + i, count) :
-#endif
                 layer_major ?
                 (defer_decoder || decoder_pending ?
                  ds41_graph_prefill_sweep(g, &e->model, &e->weights, prompt->v + i, count,
