@@ -6952,7 +6952,11 @@ extern "C" int ds4_gpu_set_model_map_spans(
      * slices once, but split sparse coordinator layer+head selections into
      * separate device images instead of allocating their huge file envelope. */
     const uint64_t bbox = max_end - min_offset;
-    if (bbox <= span_bytes + span_bytes / 10u) {
+    /* A single envelope is fine for small holes, but not for a whole skipped
+     * block: GLM 5.3 without --mtp leaves out its 2.1 GiB nextn layer, which
+     * sits between the last trunk layer and the output head. */
+    if (bbox <= span_bytes + span_bytes / 10u &&
+        bbox - span_bytes <= (UINT64_C(256) << 20)) {
         return cuda_model_copy_chunked(model_map, model_size,
                                        min_offset, bbox);
     }

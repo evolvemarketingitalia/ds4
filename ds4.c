@@ -72732,7 +72732,55 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
             free(spans.v);
-        } else {
+        }
+#ifdef DS4_ROCM_BUILD
+        else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+                   e->backend == DS4_BACKEND_CUDA &&
+                   !e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
+                   DS4_N_LAYER > DS4_N_NEXTN_PREDICT &&
+                   getenv("DS4_GLM_MAP_MTP_LAYER") == NULL) {
+            /* Resident GLM without --mtp never runs the nextn block: leave its
+             * 2.1 GiB (GLM 5.3 Q2) out of the device map instead of holding it
+             * resident next to a 300k context.  DS4_GLM_MAP_MTP_LAYER=1 maps it. */
+            ds4_model_map_span_vec spans;
+            if (!weights_model_map_spans(&e->weights,
+                                         0,
+                                         DS4_N_LAYER - DS4_N_NEXTN_PREDICT - 1u,
+                                         true,
+                                         &spans)) {
+                fprintf(stderr, "ds4: GLM model map without the MTP block failed\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+            uint64_t span_bytes = 0;
+            for (uint32_t i = 0; i < spans.len; i++) {
+                offsets[i] = spans.v[i].off;
+                sizes[i] = spans.v[i].end - spans.v[i].off;
+                span_bytes += sizes[i];
+            }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
+            e->startup_model_span_bytes = span_bytes;
+            fprintf(stderr,
+                    "ds4: %s model map without the GLM MTP block (%u spans, %.2f of %.2f GiB)\n",
+                    ds4_backend_name(e->backend),
+                    spans.len,
+                    (double)span_bytes / 1073741824.0,
+                    (double)(e->model.size - e->model.tensor_data_pos) / 1073741824.0);
+            model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
+                                                        e->model.size,
+                                                        load_offsets,
+                                                        load_sizes,
+                                                        load_span_count,
+                                                        spans.max_tensor_bytes);
+            free(spans.v);
+        }
+#endif
+        else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
