@@ -5265,9 +5265,22 @@ static bool ds4_streaming_prefill_headroom_bytes(
         return false;
     }
     (void)cacheable_experts;
+    /* The headroom stages whole routed layers for the full-layer prefill.
+     * With that path disabled (DS4_ROCM_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER)
+     * nothing uses it, so give it to the expert cache instead: on a 128 GB
+     * Strix Halo the 3.8 GiB it takes for GLM 5.3 Q2 are what keeps the last
+     * ~560 experts out of RAM.  DS4_STREAMING_PREFILL_HEADROOM_LAYERS=N
+     * overrides the layer count. */
+    uint32_t headroom_layers = DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+    if (getenv("DS4_ROCM_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER") != NULL) {
+        headroom_layers = 0;
+    }
+    {
+        const char *hl = getenv("DS4_STREAMING_PREFILL_HEADROOM_LAYERS");
+        if (hl && hl[0]) headroom_layers = (uint32_t)strtoul(hl, NULL, 10);
+    }
     const uint32_t reserve_layers =
-        cacheable_layers < DS4_STREAMING_PREFILL_HEADROOM_LAYERS ?
-        cacheable_layers : DS4_STREAMING_PREFILL_HEADROOM_LAYERS;
+        cacheable_layers < headroom_layers ? cacheable_layers : headroom_layers;
     if (per_expert_bytes > UINT64_MAX / (uint64_t)DS4_N_EXPERT) {
         return false;
     }
@@ -46494,8 +46507,11 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
      * ~1.1 ms per indexed layer).  GLM 5.3 selects up to 2048 + 3 pooled
      * rows, so the partial buffers hold 65 blocks of 32 rows; the kernels
      * need at most 64 blocks of the rows actually used (17 of 128 rows).
-     * DS4_ROCM_GLM_DISABLE_DECODE_SPLIT_GROUP8=1 restores the scalar kernel. */
-    if (getenv("DS4_ROCM_GLM_DISABLE_DECODE_SPLIT_GROUP8") != NULL) return false;
+     * Opt-in (DS4_ROCM_GLM_DECODE_SPLIT_GROUP8=1): the tiled indexed decode
+     * attention of antirez/ds4#1024 (5da2545) inside the per-head launcher
+     * measured faster on GLM 5.3 (13.8/15.0 vs 11.9/12.7 t/s at 11k). */
+    if (getenv("DS4_ROCM_GLM_DECODE_SPLIT_GROUP8") == NULL ||
+        getenv("DS4_ROCM_GLM_DISABLE_DECODE_SPLIT_GROUP8") != NULL) return false;
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
