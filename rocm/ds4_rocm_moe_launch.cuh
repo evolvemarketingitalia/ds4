@@ -624,6 +624,20 @@ static int routed_moe_launch(
     const int iq2_iq2_path = plan.iq2_iq2_path;
     const int iq2_gate_path = iq2_path || iq2_iq2_path;
     const int q2k_path = plan.q2k_path;
+    /* Halo DSpark verify: V4.1 batches of 2..8 rows run the decode wave kernels
+     * row by row on the compact batch table, so a verify row costs what a decode
+     * step's MoE costs and matches its arithmetic (DS4_ROCM_V41_ROWS_MOE=0 off). */
+    static int v41_rows_moe = -1;
+    if (v41_rows_moe < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_MOE");
+        v41_rows_moe = !(env && env[0] == '0');
+    }
+    const int v41_small_wave =
+        v41_rows_moe && g_deepseek41_model && iq2_path && !iq2_iq2_path &&
+        n_tokens >= 2u && n_tokens <= 8u &&
+        n_total_expert == 384u && n_expert == 6u &&
+        expert_in_dim == 5120u && expert_mid_dim == 2304u && out_dim == 5120u &&
+        ds4_rocm_is_gfx1151();
     const int mxfp4_path = plan.mxfp4_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
@@ -672,6 +686,7 @@ static int routed_moe_launch(
                                         gate_bytes,
                                         down_bytes);
     const int batch_stream_split_selected =
+        !v41_small_wave &&
         !stream_full_layer &&
         !full_table_cached &&
         n_tokens > 1u &&
@@ -990,6 +1005,21 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
+            } else if (v41_small_wave) {
+                for (uint32_t tok = 0; tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        gate_slot_ptrs, up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming small-batch wave gate/up launch");
             } else {
                 moe_gate_up_mid_qwarp32_ptrs_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
@@ -1009,7 +1039,7 @@ static int routed_moe_launch(
                 ok = cuda_ok(cudaGetLastError(),
                              "routed_moe streaming batch gate/up launch");
             }
-            if (ok && !iq2_path) {
+            if (ok && (!iq2_path || v41_small_wave)) {
                 dim3 midq_grid(midq_blocks, pair_count, 1);
                 q8_K_quantize_kernel<<<midq_grid, 256>>>(
                         midq,
@@ -1018,7 +1048,18 @@ static int routed_moe_launch(
                         pair_count);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
             }
-            if (ok) {
+            if (ok && v41_small_wave) {
+                for (uint32_t tok = 0; tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_down_wave_ptrs_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                        (float *)out->ptr + (uint64_t)tok * out_dim, down_slot_ptrs,
+                        midq + pair0 * midq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0, 0,
+                        down_row_bytes, midq_blocks, out_dim, n_expert);
+                }
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe streaming small-batch wave down launch");
+            } else if (ok) {
                 dim3 dgrid((out_dim + 31u) / 32u, n_tokens, 1);
                 if (iq2_iq2_path) {
                     moe_down_iq2_sum_qwarp32_ptrs_batch_kernel<<<dgrid, 256>>>(

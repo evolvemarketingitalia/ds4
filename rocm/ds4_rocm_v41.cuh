@@ -1051,6 +1051,67 @@ __global__ static void v41_q8_f32_blocks4_kernel_t(float *out,
 /* Halo: the epilogue rounding replaces a separate v41_bf16_kernel launch per projection. */
 #define v41_q8_f32_blocks4_kernel v41_q8_f32_blocks4_kernel_t<false>
 
+/* Halo DSpark verify: the decode kernel's lane layout and accumulation order for R
+ * rows at once. Each Q8 block is read once for every row; each row reduces exactly
+ * as the one-row kernel does, so a verify row matches a decode step. */
+template <uint32_t R, bool ROUND_BF16>
+__global__ static void v41_q8_f32_blocks4_rows_kernel_t(float *out,
+        const unsigned char *weights, const float *input,
+        uint32_t width, uint32_t outputs, uint64_t row_bytes) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint64_t row = (uint64_t)blockIdx.x * 8u + (threadIdx.x >> 5u);
+    if (row >= outputs) return;
+    const uint32_t blocks = width / 32u;
+    float acc[R];
+#pragma unroll
+    for (uint32_t r = 0; r < R; r++) acc[r] = 0.0f;
+    for (uint32_t b = lane / 8u; b < blocks; b += 4u) {
+        const unsigned char *p = weights + row * row_bytes + (uint64_t)b * 34u;
+        const float d = q8_0_scale_scalar(p);
+        const uint32_t j = (lane & 7u) * 4u;
+        const int8_t *q = (const int8_t *)(p + 2u) + j;
+        float w[4];
+#pragma unroll
+        for (uint32_t k = 0; k < 4u; k++) w[k] = (float)q[k];
+#pragma unroll
+        for (uint32_t r = 0; r < R; r++) {
+            const float *x = input + (uint64_t)r * width + b * 32u + j;
+            float value = 0.0f;
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) value += w[k] * x[k];
+            acc[r] += d * value;
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < R; r++) {
+        const float s = warp_sum_f32(acc[r]);
+        if (lane == 0u) out[(uint64_t)r * outputs + row] = ROUND_BF16 ? v41_bf16(s) : s;
+    }
+}
+
+static bool v41_rows_q8_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_Q8");
+        cached = !(env && env[0] == '0');
+    }
+    return cached == 1;
+}
+
+template <bool ROUND_BF16>
+static bool v41_q8_rows_small_launch(float *out, const unsigned char *weights, const float *in,
+                                     uint32_t width, uint32_t outputs, uint32_t rows) {
+    const dim3 grid((outputs + 7u) / 8u);
+    const uint64_t rb = (uint64_t)(width / 32u) * 34u;
+    switch (rows) {
+#define V41_ROWS_CASE(n) case n: v41_q8_f32_blocks4_rows_kernel_t<n, ROUND_BF16><<<grid, 256u>>>(out, weights, in, width, outputs, rb); return true;
+    V41_ROWS_CASE(2) V41_ROWS_CASE(3) V41_ROWS_CASE(4) V41_ROWS_CASE(5)
+    V41_ROWS_CASE(6) V41_ROWS_CASE(7) V41_ROWS_CASE(8)
+#undef V41_ROWS_CASE
+    default: return false;
+    }
+}
+
 extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                                 uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                                 uint32_t rows, const ds4_gpu_tensor *in) {
@@ -1062,6 +1123,9 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows(ds4_gpu_tensor *out, const void 
     const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
+    if (rows >= 2u && rows <= 8u && ds4_rocm_is_gfx1151() && v41_rows_q8_enabled() &&
+        v41_q8_rows_small_launch<false>((float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows))
+        return cuda_ok(cudaGetLastError(), "V4.1 Q8 projection (small rows)");
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8_f32_blocks4_kernel<<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
@@ -1136,6 +1200,9 @@ extern "C" int ds4_gpu_dsv41_q8_projection_rows_bf16(ds4_gpu_tensor *out, const 
     const unsigned char *weights = (const unsigned char *)cuda_model_range_ptr(
         model_map, weight_offset, weight_bytes, "V4.1 Q8 projection");
     if (!weights) return 0;
+    if (rows >= 2u && rows <= 8u && ds4_rocm_is_gfx1151() && v41_rows_q8_enabled() &&
+        v41_q8_rows_small_launch<true>((float *)out->ptr, weights, (const float *)in->ptr, width, outputs, rows))
+        return cuda_ok(cudaGetLastError(), "V4.1 Q8 projection (small rows, bf16 epilogue)");
     if (rows == 1u && ds4_rocm_is_gfx1151()) {
         v41_q8_f32_blocks4_kernel_t<true><<<(outputs + 7u) / 8u, 256u>>>(
             (float *)out->ptr, weights, (const float *)in->ptr,
@@ -1278,6 +1345,43 @@ __global__ static void v41_grouped_q8_f32_blocks4_kernel_t(
 }
 #define v41_grouped_q8_f32_blocks4_kernel v41_grouped_q8_f32_blocks4_kernel_t<false>
 
+/* Halo DSpark verify: R token rows of the grouped projection, one weight read per
+ * block, each row reduced exactly as the one-row kernel. Physical strides: G*K
+ * inputs and M*G outputs per token. */
+template <uint32_t R, bool ROUND_BF16>
+__global__ static void v41_grouped_q8_f32_blocks4_rows_kernel_t(
+        float *out, const unsigned char *w, const float *x, int K, int M, int G) {
+    int lane = threadIdx.x & 31, row = blockIdx.x * 8 + threadIdx.x / 32;
+    if (row >= M * G) return;
+    const size_t in_stride = (size_t)G * K, out_stride = (size_t)M * G;
+    const float *in = x + (row / M) * K;
+    float acc[R];
+#pragma unroll
+    for (uint32_t r = 0; r < R; r++) acc[r] = 0.0f;
+    for (int b = lane / 8; b < K / 32; b += 4) {
+        const unsigned char *p = w + ((size_t) row * (K / 32) + b) * 34;
+        const float d = __half2float(* (const __half *) p);
+        const int j = (lane & 7) * 4;
+        const int8_t *q = (const int8_t *) (p + 2) + j;
+        float wv[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) wv[k] = (float) q[k];
+#pragma unroll
+        for (uint32_t r = 0; r < R; r++) {
+            const float *xi = in + r * in_stride + b * 32 + j;
+            float v = 0;
+#pragma unroll
+            for (int k = 0; k < 4; k++) v += wv[k] * xi[k];
+            acc[r] += d * v;
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < R; r++) {
+        const float s = warp_sum_f32(acc[r]);
+        if (!lane) out[r * out_stride + row] = ROUND_BF16 ? v41_bf16(s) : s;
+    }
+}
+
 static int g_v41_attn_out_rounded = 0;
 extern "C" int ds4_gpu_dsv41_attention_output_rounded(void) { return g_v41_attn_out_rounded; }
 
@@ -1293,6 +1397,22 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     const unsigned char *b = (const unsigned char *)cuda_model_range_ptr(model_map, out_b_offset, b_bytes, "V4.1 attn_out_b");
     if (!a || !b) return 0;
     g_v41_attn_out_rounded = 0;
+    if (n_tokens >= 2u && n_tokens <= 8u && ds4_rocm_is_gfx1151() && v41_rows_q8_enabled()) {
+        /* DSpark verify rows: both projections read their weights once for all
+         * rows and round in the epilogue, as the one-row path does. */
+        switch (n_tokens) {
+#define V41_GROUPED_ROWS_CASE(n) case n: v41_grouped_q8_f32_blocks4_rows_kernel_t<n, true><<<1024u, 256u>>>( \
+            (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8); break;
+        V41_GROUPED_ROWS_CASE(2) V41_GROUPED_ROWS_CASE(3) V41_GROUPED_ROWS_CASE(4) V41_GROUPED_ROWS_CASE(5)
+        V41_GROUPED_ROWS_CASE(6) V41_GROUPED_ROWS_CASE(7) V41_GROUPED_ROWS_CASE(8)
+#undef V41_GROUPED_ROWS_CASE
+        }
+        if (!cuda_ok(cudaGetLastError(), "V4.1 attention low projection (small rows)") ||
+            !v41_q8_rows_small_launch<true>((float *)out->ptr, b, (const float *)low->ptr, 8192u, 5120u, n_tokens))
+            return 0;
+        g_v41_attn_out_rounded = 1;
+        return cuda_ok(cudaGetLastError(), "V4.1 attention output (small rows)");
+    }
     if (n_tokens == 1u && ds4_rocm_is_gfx1151()) {
         v41_grouped_q8_f32_blocks4_kernel_t<true><<<1024u, 256u>>>(
             (float *)low->ptr, a, (const float *)heads->ptr, 4096, 1024, 8);
