@@ -46486,7 +46486,29 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
 }
 
 static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected) {
-#ifndef __APPLE__
+#if defined(DS4_ROCM_BUILD)
+    /* ROCm: eight heads per block share the selected KV rows staged in LDS,
+     * with the selected rows split across blocks and an online-softmax
+     * reduce that also applies the value projection.  The per-head scalar
+     * kernel re-reads every selected row once per head (GLM 5.3 decode:
+     * ~1.1 ms per indexed layer).  GLM 5.3 selects up to 2048 + 3 pooled
+     * rows, so the partial buffers hold 65 blocks of 32 rows; the kernels
+     * need at most 64 blocks of the rows actually used (17 of 128 rows).
+     * DS4_ROCM_GLM_DISABLE_DECODE_SPLIT_GROUP8=1 restores the scalar kernel. */
+    if (getenv("DS4_ROCM_GLM_DISABLE_DECODE_SPLIT_GROUP8") != NULL) return false;
+    const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
+    const uint32_t needed_blocks =
+        block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
+    return n_selected > 512u &&
+           block_rows > 0 &&
+           needed_blocks > 0 &&
+           needed_blocks <= glm_graph_indexed_decode_split_blocks() &&
+           needed_blocks <= 64u &&
+           (DS4_N_HEAD % 8u) == 0 &&
+           DS4_N_KV_LORA == 512u &&
+           (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
+           glm_graph_compact_cache_is_f16();
+#elif !defined(__APPLE__)
     (void)n_selected;
     return false;
 #else
@@ -55083,6 +55105,54 @@ static bool glm_graph_forward_indexed_tokens(
                 }
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
+#ifdef DS4_ROCM_BUILD
+                    /* One-token slices are the streaming decode: use the split
+                     * group-of-8 kernel (attention + value projection in one
+                     * pass over the selected rows) instead of the per-head
+                     * lora kernel plus a separate value projection. */
+                    bool group8_slice_done = false;
+                    if (!slice_causal && slice == 1u && !tp_attn_head_split &&
+                        g->attn_partial_lora && g->attn_partial_ms &&
+                        glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count)) {
+                        const uint32_t g8_rows =
+                            glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
+                        const uint32_t g8_blocks =
+                            (last_indexer_selected_count + g8_rows - 1u) / g8_rows;
+                        group8_slice_done =
+                            ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+                                heads_view,
+                                g->attn_partial_lora,
+                                g->attn_partial_ms,
+                                q_view,
+                                qk_low_view,
+                                g->layer_kv_lora_cache[il],
+                                g->layer_k_rope_cache[il],
+                                model->map,
+                                model->size,
+                                l->attn_v_b->abs_offset,
+                                l->attn_v_b->type,
+                                selected_view,
+                                last_indexer_selected_count,
+                                false,
+                                g->compact_cache_cap,
+                                glm_graph_compact_cache_is_f16(),
+                                DS4_N_HEAD,
+                                DS4_N_KV_LORA,
+                                (uint32_t)g->q_nope,
+                                DS4_N_ROT,
+                                DS4_N_VALUE_MLA,
+                                0,
+                                g8_rows,
+                                g8_blocks,
+                                rope_base,
+                                rope_scale,
+                                0.0f,
+                                1.0f,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW) != 0;
+                    }
+                    if (!group8_slice_done) {
+#endif
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
                     if (slice_causal &&
                         glm_graph_use_dense_compact_attention_prefill(slice) &&
@@ -55186,6 +55256,9 @@ static bool glm_graph_forward_indexed_tokens(
                                                                       slice,
                                                                       &layer_stage_t0);
                     }
+#ifdef DS4_ROCM_BUILD
+                    }
+#endif
                 } else if (ok) {
                     int rc = ds4_gpu_glm_attention_indexed_batch_typed_tensor(heads_view,
                                                                               q_view,
@@ -55257,7 +55330,52 @@ static bool glm_graph_forward_indexed_tokens(
                 ok = q_view && qk_low_view && heads_view && selected_view;
                 if (!ok) fprintf(stderr, "ds4: GLM scalar indexed prefill failed to create attention row views at layer %u token %u\n", il, t);
                 if (ok) {
-                    int rc = ds4_gpu_glm_attention_indexed_decode_typed_tensor(heads_view,
+                    int rc = 0;
+#ifdef DS4_ROCM_BUILD
+                    /* One-token rows (streaming decode) reach this per-token
+                     * loop: use the split group-of-8 kernel when it applies,
+                     * like the resident decode graph. */
+                    if (g->attn_partial_lora && g->attn_partial_ms &&
+                        glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count)) {
+                        const uint32_t split_block_rows =
+                            glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
+                        const uint32_t split_blocks =
+                            (last_indexer_selected_count + split_block_rows - 1u) / split_block_rows;
+                        rc = ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+                                heads_view,
+                                g->attn_partial_lora,
+                                g->attn_partial_ms,
+                                q_view,
+                                qk_low_view,
+                                g->layer_kv_lora_cache[il],
+                                g->layer_k_rope_cache[il],
+                                model->map,
+                                model->size,
+                                l->attn_v_b->abs_offset,
+                                l->attn_v_b->type,
+                                selected_view,
+                                last_indexer_selected_count,
+                                false,
+                                g->compact_cache_cap,
+                                glm_graph_compact_cache_is_f16(),
+                                DS4_N_HEAD,
+                                DS4_N_KV_LORA,
+                                (uint32_t)g->q_nope,
+                                DS4_N_ROT,
+                                DS4_N_VALUE_MLA,
+                                0,
+                                split_block_rows,
+                                split_blocks,
+                                rope_base,
+                                rope_scale,
+                                0.0f,
+                                1.0f,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW);
+                    }
+                    if (rc == 0)
+#endif
+                    rc = ds4_gpu_glm_attention_indexed_decode_typed_tensor(heads_view,
                                                                                q_view,
                                                                                qk_low_view,
                                                                                g->layer_kv_lora_cache[il],
@@ -56862,6 +56980,7 @@ static bool glm_graph_forward_token(
             }
             DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "kv_path");
             DS4_GLM_FT_STAGE("DSA indexed attention");
+            bool group8_done = false;
             if (ok && (decode_ablate & DS4_GLM_ABLATE_ATTN_CORE)) {
                 /* Skip the indexed attention kernels; zero heads so the
                  * rest of the layer stays finite (timing-only). */
@@ -56882,7 +57001,8 @@ static bool glm_graph_forward_token(
                         (uint64_t)g->tp_rank * tp_head_count *
                         DS4_N_VALUE_MLA * value_row_bytes;
                 }
-                if (ok) ok = ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+bool group8_ok = false;
+                if (ok) group8_ok = ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                                                                                     tp_split_layer_heads ? tp_heads : g->heads,
                                                                                     g->attn_partial_lora,
                                                                                     g->attn_partial_ms,
@@ -56913,7 +57033,16 @@ static bool glm_graph_forward_token(
                                                                                     1.0f,
                                                                                     DS4_ROPE_YARN_BETA_FAST,
                                                                                     DS4_ROPE_YARN_BETA_SLOW) != 0;
-            } else if (ok) {
+                if (ok && !group8_ok) {
+                    static bool logged_group8_fallback = false;
+                    if (!logged_group8_fallback) {
+                        logged_group8_fallback = true;
+                        fprintf(stderr, "ds4: GLM split group-of-8 decode attention unavailable, using the per-head kernel\n");
+                    }
+                }
+                group8_done = ok && group8_ok;
+            }
+            if (ok && !(decode_ablate & DS4_GLM_ABLATE_ATTN_CORE) && !group8_done) {
                 uint64_t value_weight_offset = l->attn_v_b->abs_offset;
                 uint64_t value_row_bytes = 0;
                 if (tp_split_layer_heads) {
