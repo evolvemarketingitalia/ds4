@@ -3641,6 +3641,13 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+/* Images per request.  Agent sessions accumulate tool screenshots; a client
+ * that must drop old images to fit rewrites early history and forces a full
+ * prefill, so keep the cap well above a working session. */
+#ifndef DS4_SERVER_MAX_IMAGES
+#define DS4_SERVER_MAX_IMAGES 256
+#endif
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -3651,8 +3658,9 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    if (count > DS4_SERVER_MAX_IMAGES) {
+        snprintf(err, errlen, "too many images; at most %d are allowed",
+                 DS4_SERVER_MAX_IMAGES);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -9939,13 +9947,13 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t offsets[DS4_SERVER_MAX_IMAGES];
 } visible_image_key;
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > DS4_SERVER_MAX_IMAGES ||
         (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     const char *cursor = text;
@@ -10040,8 +10048,8 @@ struct server_slot {
     char decode_err[160];
 };
 
-#define SERVER_IMAGE_CACHE_ENTRIES 32
-#define SERVER_IMAGE_CACHE_BYTES (128u * 1024u * 1024u)
+#define SERVER_IMAGE_CACHE_ENTRIES 256
+#define SERVER_IMAGE_CACHE_BYTES (1024u * 1024u * 1024u)
 
 typedef struct {
     uint8_t *encoded;
@@ -10935,19 +10943,80 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
 }
 
 
+/* GLM (and Qwen) tool calls are XML blocks, not DSML.  The exact sampled span
+ * that tool memory records (parse_glm_generated_message_ex) starts at
+ * "<tool_call>", or at the "\n\n" right before it, and ends after the last
+ * adjacent "</tool_call>" with any trailing ASCII whitespace.  Return the next
+ * such span at or after p that tool memory knows, trying those candidates. */
+static const char *find_next_glm_tool_block_locked(server *s, const char *p,
+                                                   const char **end_out,
+                                                   tool_memory_block **block_out) {
+    static const char open_tag[] = "<tool_call>";
+    static const char close_tag[] = "</tool_call>";
+    const size_t open_len = sizeof(open_tag) - 1;
+    const size_t close_len = sizeof(close_tag) - 1;
+    *end_out = NULL;
+    *block_out = NULL;
+    const char *t = strstr(p, open_tag);
+    while (t) {
+        const char *run_end = NULL;
+        const char *q = t;
+        for (;;) {
+            const char *c = strstr(q + open_len, close_tag);
+            if (!c) break;
+            run_end = c + close_len;
+            const char *next = skip_ascii_ws(run_end);
+            if (strncmp(next, open_tag, open_len) != 0) break;
+            q = next;
+        }
+        if (!run_end) return NULL;
+        const char *starts[2] = { t, NULL };
+        if (t >= p + 2 && t[-2] == '\n' && t[-1] == '\n') starts[1] = t - 2;
+        const char *ends[2] = { skip_ascii_ws(run_end), run_end };
+        for (int i = 0; i < 2; i++) {
+            if (!starts[i]) continue;
+            for (int k = 0; k < 2; k++) {
+                if (k == 1 && ends[1] == ends[0]) continue;
+                tool_memory_block *b = tool_memory_find_block_locked(
+                    &s->tool_mem, starts[i], (size_t)(ends[k] - starts[i]));
+                if (b) {
+                    *end_out = ends[k];
+                    *block_out = b;
+                    return starts[i];
+                }
+            }
+        }
+        t = strstr(run_end, open_tag);
+    }
+    return NULL;
+}
+
+/* Tool-map scan forms: 0 = DSML blocks (DeepSeek), 1 = GLM/Qwen <tool_call>. */
+static const char *kv_tool_map_find_block_locked(server *s, int form,
+                                                 const char *p,
+                                                 const char **end_out,
+                                                 tool_memory_block **block_out) {
+    if (form != 0) return find_next_glm_tool_block_locked(s, p, end_out, block_out);
+    const char *start = find_next_dsml_tool_block(p, end_out);
+    *block_out = start && *end_out ?
+        tool_memory_find_block_locked(&s->tool_mem, start,
+                                      (size_t)(*end_out - start)) : NULL;
+    return start;
+}
+
 static bool kv_tool_map_measure_locked(server *s, const char *text,
                                        uint32_t *count_out,
                                        uint64_t *bytes_out) {
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
     uint64_t scan = ++s->tool_mem.scan_clock;
+    for (int form = 0; form < 2; form++) {
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        tool_memory_block *b = NULL;
+        const char *start = kv_tool_map_find_block_locked(s, form, p, &end, &b);
         if (!start || !end) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -10964,6 +11033,7 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
             }
         }
         p = end;
+    }
     }
     if (count == 0) bytes = 0;
     if (count_out) *count_out = count;
@@ -11009,13 +11079,13 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
 
     uint64_t scan = ++s->tool_mem.scan_clock;
+    for (int form = 0; form < 2 && ok; form++) {
     const char *p = text;
     for (;;) {
         const char *end = NULL;
-        const char *start = find_next_dsml_tool_block(p, &end);
+        tool_memory_block *b = NULL;
+        const char *start = kv_tool_map_find_block_locked(s, form, p, &end, &b);
         if (!start || !end || !ok) break;
-        tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -11031,6 +11101,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
             }
         }
         p = end;
+    }
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -11092,6 +11163,8 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 
 
 
+static bool kv_skip_vision_trailer(FILE *fp, uint8_t ext_flags);
+
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
     if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
     stop_list wanted = {0};
@@ -11123,7 +11196,8 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         uint64_t skip = (uint64_t)text_bytes + hdr.payload_bytes;
         if (ok && hdr.model_id == model_id && (hdr.ext_flags & KV_EXT_TOOL_MAP) &&
             skip <= (uint64_t)INT64_MAX &&
-            fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
+            fseeko(fp, (off_t)skip, SEEK_CUR) == 0 &&
+            kv_skip_vision_trailer(fp, hdr.ext_flags))
         {
             kv_tool_map_load_from_pos(s, fp, &wanted);
         }
@@ -11261,7 +11335,19 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
  * A load validates them against the request's images before the payload is
  * trusted, then installs them into the session. */
 #define KV_VISION_TRAILER_MAGIC "DSVI"
-#define KV_VISION_TRAILER_MAX 16
+#define KV_VISION_TRAILER_MAX DS4_SERVER_MAX_IMAGES
+
+/* kv_cache_trailer_write_cb() writes image identities before the tool map;
+ * readers that only want the tool map must step over them. */
+static bool kv_skip_vision_trailer(FILE *fp, uint8_t ext_flags) {
+    if (!(ext_flags & KV_EXT_VISION)) return true;
+    uint8_t h[8];
+    if (fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+        memcmp(h, KV_VISION_TRAILER_MAGIC, 4) != 0) return false;
+    const uint32_t n = le_get32(h + 4);
+    if (n > KV_VISION_TRAILER_MAX) return false;
+    return fseeko(fp, (off_t)n * 40, SEEK_CUR) == 0;
+}
 
 typedef struct {
     server *s;
@@ -11592,6 +11678,110 @@ static int kv_cache_disk_prefix_tokens(server *s, server_slot *slot,
     return tokens;
 }
 
+/* Byte boundary of text[0,len) inside detok(tokens).  *boundary_out counts the
+ * leading tokens whose bytes lie entirely inside the text; when the next token
+ * straddles the end, *straddle_out is how many of its bytes belong to the text.
+ * False when the bytes disagree or the tokens end first. */
+static bool detok_prefix_boundary(ds4_engine *engine, const ds4_tokens *tokens,
+                                  const char *text, size_t len,
+                                  int *boundary_out, size_t *straddle_out) {
+    if (boundary_out) *boundary_out = 0;
+    if (straddle_out) *straddle_out = 0;
+    if (!engine || !tokens || !text) return false;
+    size_t off = 0;
+    int i = 0;
+    for (; i < tokens->len && off < len; i++) {
+        size_t plen = 0;
+        char *piece = ds4_token_text(engine, tokens->v[i], &plen);
+        if (!piece) return false;
+        const size_t take = plen < len - off ? plen : len - off;
+        const bool same = take == 0 || memcmp(piece, text + off, take) == 0;
+        free(piece);
+        if (!same) return false;
+        if (take < plen) {
+            if (boundary_out) *boundary_out = i;
+            if (straddle_out) *straddle_out = take;
+            return true;
+        }
+        off += plen;
+    }
+    if (off < len) return false;
+    if (boundary_out) *boundary_out = i;
+    return true;
+}
+
+/* memory-detok: the live tokens were sampled, the request's come from
+ * re-tokenizing the re-rendered history.  Canonical BPE (and tool rendering)
+ * need not reproduce sampled ids even when the bytes are identical, and GLM's
+ * recurrent KDA state cannot rewind to the token-level common prefix.  When
+ * detok(live) is a byte prefix of detok(request), keep the live tokens verbatim
+ * and continue with the request tokens after that byte boundary; a straddling
+ * token is re-read from its remaining bytes.  Image blocks are special tokens:
+ * they never straddle, the ones before the boundary must be the live images
+ * (count and fingerprints) and later ones move to their new positions. */
+static bool build_live_prompt_detok(server *s, server_slot *slot,
+                                    const request *req,
+                                    const char *live_text, size_t live_len,
+                                    ds4_tokens *out) {
+    const ds4_tokens *live = slot ? ds4_session_tokens(slot->session) : NULL;
+    if (!s || !live || !live_text || !req ||
+        req->image_count > DS4_SERVER_MAX_IMAGES) return false;
+    int boundary = 0;
+    size_t straddle = 0;
+    if (!detok_prefix_boundary(s->engine, &req->prompt, live_text, live_len,
+                               &boundary, &straddle)) return false;
+    const int resume = boundary + (straddle ? 1 : 0);
+    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    ds4_vision_span spans[DS4_SERVER_MAX_IMAGES];
+    size_t old_count = 0;
+    for (size_t i = 0; i < req->image_count; i++) {
+        spans[i] = req->images[i];
+        const int64_t start = (int64_t)req->images[i].token_start - wrapper;
+        const int64_t end = (int64_t)req->images[i].token_start +
+                            req->images[i].embedding.token_count + wrapper;
+        if (end <= boundary) {
+            if (old_count != i) return false;
+            old_count = i + 1;
+        } else if (start < resume) {
+            return false;
+        }
+    }
+    if (!ds4_session_rebase_vision_state(slot->session, spans, old_count)) return false;
+    ds4_tokens prompt = {0};
+    ds4_tokens_copy(&prompt, live);
+    if (straddle) {
+        size_t plen = 0;
+        char *piece = ds4_token_text(s->engine, req->prompt.v[boundary], &plen);
+        /* Never split something that could be a special token into text. */
+        bool plain = piece && straddle < plen;
+        for (size_t k = 0; plain && k < plen; k++)
+            if (piece[k] == '<' || piece[k] == '>' || piece[k] == '|' ||
+                piece[k] == '[' || piece[k] == ']') plain = false;
+        if (!plain) {
+            free(piece);
+            ds4_tokens_free(&prompt);
+            return false;
+        }
+        char *rest = xstrndup(piece + straddle, plen - straddle);
+        free(piece);
+        ds4_tokenize_rendered_chat(s->engine, rest, &prompt);
+        free(rest);
+    }
+    const int64_t shift = (int64_t)prompt.len - resume;
+    for (int p = resume; p < req->prompt.len; p++) ds4_tokens_push(&prompt, req->prompt.v[p]);
+    for (size_t i = old_count; i < req->image_count; i++)
+        spans[i].token_start = (uint32_t)((int64_t)req->images[i].token_start + shift);
+    if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
+        ds4_tokens_free(&prompt);
+        return false;
+    }
+    for (size_t i = 0; i < req->image_count; i++)
+        req->images[i].token_start = spans[i].token_start;
+    ds4_tokens_free(out);
+    *out = prompt;
+    return true;
+}
+
 /* Multimodal requests key their disk checkpoints by the rendered prompt
  * tokens (client text carries per-request image marker nonces) and validate
  * the stored image identities against the request before trusting the
@@ -11599,8 +11789,11 @@ static int kv_cache_disk_prefix_tokens(server *s, server_slot *slot,
  * suffix is re-tokenized, so image token blocks are never guessed. */
 static int kv_cache_try_load_multimodal(server *s, server_slot *slot,
                                         const request *req,
+                                        ds4_tokens *effective_prompt,
+                                        bool *effective_used,
                                         char **loaded_path_out,
                                         uint8_t *loaded_ext_flags_out) {
+    if (effective_used) *effective_used = false;
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     if (!s || !slot || !req || !s->kv.enabled) return 0;
@@ -11626,11 +11819,25 @@ static int kv_cache_try_load_multimodal(server *s, server_slot *slot,
     const char *reject = NULL;
     if (loaded > 0) {
         const ds4_tokens *live = ds4_session_tokens(slot->session);
-        if (!live || live->len != loaded ||
-            !ds4_tokens_starts_with(&req->prompt, live)) {
+        if (!live || live->len != loaded) {
             reject = "token prefix mismatch";
         } else if (ctx.vision_mismatch) {
             reject = "vision trailer unreadable";
+        } else if (!ds4_tokens_starts_with(&req->prompt, live)) {
+            /* Same bytes, different ids (sampled vs re-tokenized history):
+             * install the stored identities and align on detokenized bytes. */
+            size_t live_len = 0;
+            char *live_text = render_tokens_text(s->engine, live, &live_len);
+            if (!live_text || !effective_prompt ||
+                !ds4_session_set_vision_identities(slot->session, ctx.images,
+                                                   ctx.image_count) ||
+                !build_live_prompt_detok(s, slot, req, live_text, live_len,
+                                         effective_prompt)) {
+                reject = "token prefix mismatch";
+            } else if (effective_used) {
+                *effective_used = true;
+            }
+            free(live_text);
         } else {
             /* Every request image inside the loaded prefix must be the stored
              * one, and every stored image must be in the request. */
@@ -11680,8 +11887,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix || req->image_count > DS4_SERVER_MAX_IMAGES) return false;
+    ds4_vision_span spans[DS4_SERVER_MAX_IMAGES];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
@@ -11795,6 +12002,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_MEMORY_DETOK,
 } slot_reuse_kind;
 
 typedef struct {
@@ -11963,6 +12171,20 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.kind = REUSE_MEMORY_TEXT;
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
+        return pr;
+    }
+
+    /* memory-detok: multimodal twin of memory-text.  Request text carries
+     * per-request image-marker nonces, so compare in token-text space: the
+     * rendered live text must be a byte prefix of detok(request).  The
+     * fingerprint gate above already checked the live images. */
+    if (req->image_count > 0 && slot->live_text && slot->live_text_pos == live_pos &&
+        common < live_pos &&
+        detok_prefix_boundary(s->engine, &req->prompt, slot->live_text,
+                              slot->live_text_len, NULL, NULL))
+    {
+        pr.kind = REUSE_MEMORY_DETOK;
+        pr.reuse_tokens = live_pos;
         return pr;
     }
 
@@ -13890,6 +14112,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
         break;
+    case REUSE_MEMORY_DETOK:
+        if (!build_live_prompt_detok(s, slot, &j->req, slot->live_text,
+                                     slot->live_text_len, &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
+        live_materialized = true;
+        cache_source = "memory-detok";
+        prompt_for_sync = &effective_prompt;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live kv reuse via detokenized bytes live=%d prompt=%d effective=%d",
+                   old_pos, j->req.prompt.len, effective_prompt.len);
+        break;
     case REUSE_NONE:
     default:
         cached = 0;
@@ -13940,12 +14176,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     } else if (multimodal && cached == 0) {
+        bool mm_detok = false;
         disk_cached = kv_cache_try_load_multimodal(s, slot, &j->req,
+                                                   &effective_prompt, &mm_detok,
                                                    &disk_cache_path,
                                                    &disk_cache_ext_flags);
         if (disk_cached > 0) {
             cached = disk_cached;
-            cache_source = "disk-multimodal";
+            cache_source = mm_detok ? "disk-multimodal-detok" : "disk-multimodal";
+            if (mm_detok) {
+                prompt_for_sync = &effective_prompt;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: kv cache multimodal load aligned on detokenized bytes tokens=%d prompt=%d",
+                           disk_cached, effective_prompt.len);
+            }
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -23083,13 +23327,13 @@ static void test_responses_tool_image_output(void) {
 
 static void test_server_image_embedding_cache(void) {
     server_image_cache cache = {0};
-    uint8_t key = 1;
+    uint16_t key = 1;  /* two bytes: more distinct keys than cache entries */
     float data[2] = {1.25f, -2.5f};
-    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    server_image_input input = {.encoded = (void *)&key, .encoded_len = sizeof(key)};
     ds4_vision_embedding src = {.data = data, .token_count = 1,
                                .width = 42, .fingerprint = {7}};
     ds4_vision_embedding out = {0};
-    const size_t budget = 2 * (sizeof(data) + 1);
+    const size_t budget = 2 * (sizeof(data) + sizeof(key));
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_put(&cache, &input, &src, 2, budget);
     TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
@@ -23116,7 +23360,7 @@ static void test_server_image_embedding_cache(void) {
     TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
     for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
         server_image_cache_put(&cache, &input, &src, 2, 4096);
-    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + sizeof(key)));
     key = 1;
     TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
     server_image_cache_clear(&cache);
