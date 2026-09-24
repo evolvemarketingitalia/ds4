@@ -50,6 +50,19 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
         uint64_t out_a_offset, uint64_t out_b_offset,
         const ds4_gpu_tensor *heads, uint32_t n_tokens, uint32_t tp_rank);
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
+/* DSpark V4.1: the mean over the HC copies of `rows` streams, into columns
+ * [out_off, out_off + dim) of rows of `out_stride` floats. */
+int ds4_gpu_dsv41_hc_mean(uint32_t rows, uint32_t dim, uint32_t hc,
+                         const ds4_gpu_tensor *stream, ds4_gpu_tensor *out,
+                         uint32_t out_stride, uint32_t out_off);
+/* Draft `block` tokens in sequence: tokens[step + 1] is the argmax of
+ * logits[step] + head . embed[tokens[step]], conf[step] the confidence logit. */
+int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32_t rank, uint32_t dim,
+                              const ds4_gpu_tensor *logits, const ds4_gpu_tensor *x,
+                              const void *model_map, uint64_t model_size,
+                              uint64_t embed_offset, uint64_t head_offset, int f16,
+                              const ds4_gpu_tensor *conf_proj, ds4_gpu_tensor *tokens,
+                              ds4_gpu_tensor *conf, ds4_gpu_tensor *parts, uint32_t n_parts);
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
