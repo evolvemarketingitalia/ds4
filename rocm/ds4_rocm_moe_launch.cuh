@@ -3031,6 +3031,41 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16, bool force_resident) {
     if (mid_is_f16) *mid_is_f16 = false;
+    /* GLM 5.3 MTP verification (2 rows) and other tiny batches: the one-token
+     * decode kernels (V4.1 wave gate/up and Q8_K down) read each routed
+     * expert once per token, while the tiled batch kernels spend ~3.6x the
+     * one-token time on 2 rows.  Only with DS4_ROCM_GLM_WAVE_DECODE's topology. */
+    static int small_split_env = -1;
+    if (small_split_env < 0) {
+        small_split_env = getenv("DS4_ROCM_GLM_WAVE_DECODE") != NULL &&
+                          getenv("DS4_ROCM_DISABLE_MOE_SMALL_BATCH_SPLIT") == NULL;
+    }
+    if (small_split_env && n_tokens >= 2u && n_tokens <= 4u &&
+        !g_deepseek41_model && n_total_expert == 288u && n_expert == 8u &&
+        expert_in_dim == 4096u && expert_mid_dim == 2048u && out_dim == 4096u &&
+        out && gate && up && mid && down && selected && weights && x) {
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            ds4_gpu_tensor out_t = {(char *)out->ptr + (uint64_t)t * out_dim * sizeof(float),
+                                    (uint64_t)out_dim * sizeof(float), 0};
+            ds4_gpu_tensor sel_t = {(char *)selected->ptr + (uint64_t)t * n_expert * sizeof(int32_t),
+                                    (uint64_t)n_expert * sizeof(int32_t), 0};
+            ds4_gpu_tensor w_t = {(char *)weights->ptr + (uint64_t)t * n_expert * sizeof(float),
+                                  (uint64_t)n_expert * sizeof(float), 0};
+            ds4_gpu_tensor x_t = {(char *)x->ptr + (uint64_t)t * expert_in_dim * sizeof(float),
+                                  (uint64_t)expert_in_dim * sizeof(float), 0};
+            if (!routed_moe_launch(&out_t, gate, up, mid, down, model_map, model_size,
+                                   gate_offset, up_offset, down_offset,
+                                   gate_type, down_type,
+                                   gate_expert_bytes, gate_row_bytes,
+                                   down_expert_bytes, down_row_bytes,
+                                   expert_in_dim, expert_mid_dim, out_dim,
+                                   &sel_t, &w_t, n_total_expert, n_expert, clamp, &x_t,
+                                   layer_index, 1u, force_resident)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

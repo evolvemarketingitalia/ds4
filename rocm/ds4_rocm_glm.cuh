@@ -758,6 +758,36 @@ __global__ static void glm53_rocm_matmul_q4_K_f32_batch_wmma_rowtile_kernel(
 }
 #endif
 
+/* Q4_K matvec for 2..4 rows (MTP verification): one pass over each weight
+ * block for all rows instead of one launch row per token. */
+template <uint32_t ROWS>
+__global__ static void glm53_rocm_matmul_q4_K_q8_K_rows_kernel(
+        float *out,
+        const cuda_block_q4_K *weights,
+        const cuda_block_q8_K *xq,
+        uint32_t n_blocks,
+        uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t col = blockIdx.x * 32u + row_lane;
+    if (col >= out_dim) return;
+    const cuda_block_q4_K *wrow = weights + (uint64_t)col * n_blocks;
+    float sum[ROWS];
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) sum[r] = 0.0f;
+    for (uint32_t b = lane; b < n_blocks; b += 8u) {
+#pragma unroll
+        for (uint32_t r = 0; r < ROWS; r++) {
+            sum[r] += dev_dot_q4_K_q8_K_block(wrow + b, xq + (uint64_t)r * n_blocks + b);
+        }
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < ROWS; r++) {
+        const float v = quarter_warp_sum_f32(sum[r], lane);
+        if (lane == 0u) out[(uint64_t)r * out_dim + col] = v;
+    }
+}
+
 extern "C" int ds4_gpu_matmul_q4_K_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -840,6 +870,23 @@ extern "C" int ds4_gpu_matmul_q4_K_tensor(
     if (!cuda_ok(cudaGetLastError(),
                  "GLM-5.3 Q4_K activation quantization launch")) {
         return 0;
+    }
+    if (n_rows >= 2u && n_rows <= 4u && getenv("DS4_ROCM_DISABLE_Q4K_ROWS") == NULL) {
+        const dim3 rgrid(((uint32_t)out_dim + 31u) / 32u, 1u, 1u);
+        if (n_rows == 2u) {
+            glm53_rocm_matmul_q4_K_q8_K_rows_kernel<2><<<rgrid, 256u>>>(
+                (float *)out->ptr, (const cuda_block_q4_K *)weight, xq,
+                (uint32_t)n_blocks, (uint32_t)out_dim);
+        } else if (n_rows == 3u) {
+            glm53_rocm_matmul_q4_K_q8_K_rows_kernel<3><<<rgrid, 256u>>>(
+                (float *)out->ptr, (const cuda_block_q4_K *)weight, xq,
+                (uint32_t)n_blocks, (uint32_t)out_dim);
+        } else {
+            glm53_rocm_matmul_q4_K_q8_K_rows_kernel<4><<<rgrid, 256u>>>(
+                (float *)out->ptr, (const cuda_block_q4_K *)weight, xq,
+                (uint32_t)n_blocks, (uint32_t)out_dim);
+        }
+        return cuda_ok(cudaGetLastError(), "GLM-5.3 Q4_K rows matmul launch");
     }
     const dim3 grid(((uint32_t)out_dim + 31u) / 32u,
                     (uint32_t)n_rows, 1u);
@@ -1024,7 +1071,8 @@ __global__ static void glm53_rocm_kda_prefill_prepare_kernel(
         const float *dt_bias,
         uint32_t n_heads,
         uint32_t n_tokens,
-        float lower_bound) {
+        float lower_bound,
+        float *conv_snap = NULL) {
     const uint32_t head = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     const uint32_t lane = tid & 31u;
@@ -1069,6 +1117,14 @@ __global__ static void glm53_rocm_kda_prefill_prepare_kernel(
         v_state[channel] = v_state[projection + channel];
         v_state[projection + channel] = v_state[2ull * projection + channel];
         v_state[2ull * projection + channel] = v_new;
+        if (conv_snap && token == 0u) {
+            /* MTP verification: the conv history after the first row, so a
+             * rejected draft restores it instead of replaying the token. */
+            for (uint32_t w = 0; w < 3u * GLM53_ROCM_KDA_HISTORY; w++) {
+                conv_snap[(uint64_t)w * projection + channel] =
+                    conv_state[(uint64_t)w * projection + channel];
+            }
+        }
 
         sq[tid] = glm53_rocm_silu(q_acc);
         sk[tid] = glm53_rocm_silu(k_acc);
@@ -1105,7 +1161,8 @@ __global__ static void glm53_rocm_kda_prefill_recurrence_kernel(
         const float *decay,
         const float *raw_beta,
         uint32_t n_heads,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        float *state_snap = NULL) {
     const uint32_t head = blockIdx.x;
     const uint32_t value = blockIdx.y * WAVES + (threadIdx.x >> 5u);
     const uint32_t lane = threadIdx.x & 31u;
@@ -1157,6 +1214,11 @@ __global__ static void glm53_rocm_kda_prefill_recurrence_kernel(
         const float result =
             glm53_rocm_lane0(warp_sum_f32(dot4_f32(h, q4)));
         if (lane == 0u) out[base + value] = result;
+        if (state_snap && token == 0u) {
+            *(float4 *)(state_snap +
+                ((uint64_t)head * GLM53_ROCM_KDA_DIM + value) *
+                GLM53_ROCM_KDA_DIM + k0) = h;
+        }
     }
     *state_ptr = h;
 }
@@ -1260,6 +1322,17 @@ extern "C" int ds4_gpu_glm53_kda_decode(
     return cuda_ok(cudaGetLastError(), "GLM-5.3 KDA decode launch");
 }
 
+/* Optional prefix-1 snapshot for the next KDA prefill call (GLM MTP
+ * verification of two rows): conv history and recurrent state after row 0. */
+static float *g_glm53_kda_conv_snap = NULL;
+static float *g_glm53_kda_state_snap = NULL;
+
+extern "C" void ds4_gpu_glm53_kda_set_prefix1_snapshot(ds4_gpu_tensor *conv_snap,
+                                                       ds4_gpu_tensor *state_snap) {
+    g_glm53_kda_conv_snap = conv_snap ? (float *)conv_snap->ptr : NULL;
+    g_glm53_kda_state_snap = state_snap ? (float *)state_snap->ptr : NULL;
+}
+
 extern "C" int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -1323,7 +1396,7 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
             (float *)q->ptr, (float *)k->ptr, (float *)v->ptr,
             (float *)raw_gate->ptr, (float *)conv_state->ptr,
             qw, kw, vw, a_log, dt_bias, n_heads, n_tokens,
-            gate_lower_bound);
+            gate_lower_bound, n_tokens >= 2u ? g_glm53_kda_conv_snap : NULL);
     if (!cuda_ok(cudaGetLastError(),
                  "GLM-5.3 KDA prefill prepare launch")) {
         return 0;
@@ -1335,7 +1408,8 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
                 (float *)out->ptr, (float *)recurrent_state->ptr,
                 (const float *)q->ptr, (const float *)k->ptr,
                 (const float *)v->ptr, (const float *)raw_gate->ptr,
-                (const float *)raw_beta->ptr, n_heads, n_tokens);
+                (const float *)raw_beta->ptr, n_heads, n_tokens,
+                n_tokens >= 2u ? g_glm53_kda_state_snap : NULL);
     } else
 #endif
     {
@@ -1344,7 +1418,8 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
                 (float *)out->ptr, (float *)recurrent_state->ptr,
                 (const float *)q->ptr, (const float *)k->ptr,
                 (const float *)v->ptr, (const float *)raw_gate->ptr,
-                (const float *)raw_beta->ptr, n_heads, n_tokens);
+                (const float *)raw_beta->ptr, n_heads, n_tokens,
+                n_tokens >= 2u ? g_glm53_kda_state_snap : NULL);
     }
     if (!cuda_ok(cudaGetLastError(),
                  "GLM-5.3 KDA prefill recurrence launch")) {

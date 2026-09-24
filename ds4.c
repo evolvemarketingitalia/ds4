@@ -45677,6 +45677,12 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *kda_out;
     ds4_gpu_tensor *layer_kda_conv_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_kda_recurrent_state[DS4_MAX_LAYER];
+    /* MTP verification: KDA conv/recurrent state after the first of the two
+     * verified rows, so a rejected draft restores it instead of replaying. */
+    ds4_gpu_tensor *kda_prefix1_conv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *kda_prefix1_rec[DS4_MAX_LAYER];
+    bool            mtp_prefix1_capture;
+    uint32_t        mtp_prefix1_layers;
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
@@ -47590,6 +47596,8 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
+        ds4_gpu_tensor_free(g->kda_prefix1_conv[il]);
+        ds4_gpu_tensor_free(g->kda_prefix1_rec[il]);
         ds4_gpu_tensor_free(g->layer_indexer_key_cache[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_k[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_gate[il]);
@@ -48557,6 +48565,11 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+#ifdef DS4_ROCM_BUILD
+void ds4_gpu_glm53_kda_set_prefix1_snapshot(ds4_gpu_tensor *conv_snap,
+                                            ds4_gpu_tensor *state_snap);
+#endif
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -48641,6 +48654,12 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
+#ifdef DS4_ROCM_BUILD
+    const bool prefix1_snap = ok && g->mtp_prefix1_capture && rows == 2u &&
+        g->kda_prefix1_conv[il] && g->kda_prefix1_rec[il];
+    ds4_gpu_glm53_kda_set_prefix1_snapshot(prefix1_snap ? g->kda_prefix1_conv[il] : NULL,
+                                           prefix1_snap ? g->kda_prefix1_rec[il] : NULL);
+#endif
     if (ok) ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
@@ -48663,6 +48682,10 @@ static bool glm53_graph_kda_attention_rows(
             rows,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
+#ifdef DS4_ROCM_BUILD
+    ds4_gpu_glm53_kda_set_prefix1_snapshot(NULL, NULL);
+    if (ok && prefix1_snap) g->mtp_prefix1_layers++;
+#endif
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_out_ready", g->batch_kda_out,
             (uint64_t)rows * projection, il, pos0);
@@ -51833,6 +51856,56 @@ static uint64_t glm53_graph_spec_state_bytes(const ds4_glm_gpu_graph *g) {
     }
     return total;
 }
+
+#ifdef DS4_ROCM_BUILD
+static uint32_t glm53_graph_kda_layers_in_slice(const ds4_glm_gpu_graph *g) {
+    uint32_t n = 0;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (ds4_glm53_layer_is_kda(il) && g->layer_kda_conv_state[il] &&
+            g->layer_kda_recurrent_state[il]) n++;
+    }
+    return n;
+}
+
+static bool glm53_graph_prefix1_ensure(ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53) return false;
+    if (getenv("DS4_GLM_MTP_DISABLE_PREFIX1") != NULL) return false;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il) || !g->layer_kda_conv_state[il] ||
+            !g->layer_kda_recurrent_state[il]) continue;
+        if (!g->kda_prefix1_conv[il]) {
+            g->kda_prefix1_conv[il] =
+                ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il]));
+        }
+        if (!g->kda_prefix1_rec[il]) {
+            g->kda_prefix1_rec[il] =
+                ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il]));
+        }
+        if (!g->kda_prefix1_conv[il] || !g->kda_prefix1_rec[il]) return false;
+    }
+    return true;
+}
+
+/* Rejected draft: the KDA layers go back to their state after the first
+ * verified row.  Indexer tails, compact KV and pooled rows written for the
+ * second row are rewritten by the next token at that position. */
+static bool glm53_graph_restore_prefix1(ds4_glm_gpu_graph *g) {
+    bool ok = glm_graph_begin_commands_if_needed();
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il) || !g->kda_prefix1_conv[il] ||
+            !g->kda_prefix1_rec[il]) continue;
+        ok = ds4_gpu_tensor_copy(g->layer_kda_conv_state[il], 0,
+                                 g->kda_prefix1_conv[il], 0,
+                                 ds4_gpu_tensor_bytes(g->layer_kda_conv_state[il])) != 0 &&
+             ds4_gpu_tensor_copy(g->layer_kda_recurrent_state[il], 0,
+                                 g->kda_prefix1_rec[il], 0,
+                                 ds4_gpu_tensor_bytes(g->layer_kda_recurrent_state[il])) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+#endif
 
 static bool glm53_graph_copy_spec_state(
         ds4_glm_gpu_graph *g,
@@ -74965,9 +75038,14 @@ static int ds4_session_glm_spec_cycle_impl(
 #ifdef DS4_ROCM_BUILD
     const uint32_t dense_limit = glm_graph_dense_compact_attention_limit(g);
 #endif
+    bool prefix1_ok = false;
     if (g->glm53) {
         state_saved = glm_graph_mtp_ensure(g) &&
                     glm53_graph_copy_spec_state(g, true);
+#ifdef DS4_ROCM_BUILD
+        g->mtp_prefix1_layers = 0;
+        g->mtp_prefix1_capture = state_saved && glm53_graph_prefix1_ensure(g);
+#endif
         if (state_saved) {
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
@@ -75035,6 +75113,13 @@ static int ds4_session_glm_spec_cycle_impl(
                                          toks, pos, 2,
                                          s->glm_mtp_hc, s->logits);
     }
+#ifdef DS4_ROCM_BUILD
+    if (g->glm53) {
+        prefix1_ok = verified && g->mtp_prefix1_capture &&
+                     g->mtp_prefix1_layers == glm53_graph_kda_layers_in_slice(g);
+        g->mtp_prefix1_capture = false;
+    }
+#endif
     if (!verified && !g->glm53) {
         if (!glm_graph_indexed_prefill_batch_ready(g, pos) ||
             glm_graph_limit_indexed_prefill_chunk(g, pos, 2u) < 2u ||
@@ -75162,7 +75247,21 @@ static int ds4_session_glm_spec_cycle_impl(
         accepted[1] = d;
     } else {
         bool replay_ok = true;
-        if (g->glm53) {
+        if (g->glm53 && prefix1_ok) {
+#ifdef DS4_ROCM_BUILD
+            /* The verification already produced row 0: restore the KDA
+             * state after it and reuse its logits and hidden row. */
+            replay_ok = glm53_graph_restore_prefix1(g) &&
+                        ds4_gpu_tensor_write(g->hc_cur,
+                                             0,
+                                             s->glm_mtp_hc,
+                                             hc_row_bytes) != 0;
+            if (replay_ok) {
+                memcpy(s->logits, s->glm_mtp_logits0,
+                       (size_t)DS4_N_VOCAB * sizeof(float));
+            }
+#endif
+        } else if (g->glm53) {
             replay_ok = glm53_graph_copy_spec_state(g, false) &&
                         glm_graph_forward_token(g,
                                                 &e->model,
