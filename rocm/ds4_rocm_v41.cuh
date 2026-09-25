@@ -944,6 +944,94 @@ static cuda_hipblaslt_gemm_plan *v41_engram_lt_plan(uint32_t rows) {
         "V4.1 Engram F16/F32", HIP_R_32F, 2539);
 }
 
+/* Halo DSpark verify: 2..8 rows of an F16 projection in one pass over the weight.
+ * Each row keeps the one-row shared-X decode arithmetic exactly: one wave per
+ * output, lane l adds w[i]*x[i] for i = l + 256k + 32u in the same order, then
+ * warp_sum_f32. X is staged through LDS in 1024-column chunks so eight rows fit;
+ * requires width % 256 == 0 (the one-row main loop then has no tail). */
+template <int R>
+__global__ static void v41_f16_sharedx_rows_kernel(float *out, const __half *w, const float *x,
+                                                   uint32_t width, uint32_t outputs) {
+    __shared__ float shx[R][1024];
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, wave = tid >> 5u;
+    const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + wave;
+    const bool active = row < outputs;
+    const __half *wr = w + (uint64_t)(active ? row : 0u) * width;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+    for (uint32_t c0 = 0; c0 < width; c0 += 1024u) {
+        const uint32_t n = width - c0 < 1024u ? width - c0 : 1024u;
+        __syncthreads();
+        for (uint32_t j = tid; j < (uint32_t)R * n; j += blockDim.x) {
+            const uint32_t r = j / n, k = j - r * n;
+            shx[r][k] = x[(uint64_t)r * width + c0 + k];
+        }
+        __syncthreads();
+        if (active) {
+            for (uint32_t i = lane; i < n; i += 256u) {
+#pragma unroll
+                for (uint32_t u = 0; u < 8u; u++) {
+                    const float wv = __half2float(wr[c0 + i + 32u * u]);
+#pragma unroll
+                    for (int r = 0; r < R; r++) acc[r] += wv * shx[r][i + 32u * u];
+                }
+            }
+        }
+    }
+    if (!active) return;
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = warp_sum_f32(acc[r]);
+    if (lane == 0u) {
+#pragma unroll
+        for (int r = 0; r < R; r++) out[(uint64_t)r * outputs + row] = acc[r];
+    }
+}
+
+/* The HC mixer projection (20480 -> 24) for 2..7 rows: the one-row decode's
+ * ordered-chunks arithmetic per row (thread t sums its contiguous chunk in
+ * ascending order, thread 0 adds the 32 partials in order), one weight pass.
+ * The token-tiled prefill kernel keeps too few blocks busy at these sizes. */
+template <int R>
+__global__ static void v41_hc_ordered_rows_kernel(float *out, const __half *w, const float *x,
+                                                  uint32_t width, uint32_t outputs) {
+    const uint32_t row = blockIdx.x, tid = threadIdx.x;
+    if (row >= outputs) return;
+    __shared__ float partial[R][32];
+    const uint32_t chunk = (width + 31u) / 32u;
+    const uint32_t k0 = tid * chunk;
+    const uint32_t k1 = k0 + chunk < width ? k0 + chunk : width;
+    const __half *wr = w + (uint64_t)row * width;
+    float sum[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) sum[r] = 0.0f;
+    for (uint32_t i = k0; i < k1; i++) {
+        const float wv = __half2float(wr[i]);
+#pragma unroll
+        for (int r = 0; r < R; r++) sum[r] += wv * x[(uint64_t)r * width + i];
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) partial[r][tid] = sum[r];
+    __syncthreads();
+    if (tid == 0) {
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float total = 0.0f;
+            for (uint32_t i = 0; i < 32u; i++) total += partial[r][i];
+            out[(uint64_t)r * outputs + row] = total;
+        }
+    }
+}
+
+static int v41_rows_f16_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_F16");
+        on = !(env && env[0] == '0');
+    }
+    return on;
+}
+
 extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
                                              uint64_t weight_offset, uint32_t width, uint32_t outputs,
                                              uint32_t rows, const ds4_gpu_tensor *in) {
@@ -989,6 +1077,23 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         }
         /* Partial batches retain the existing per-row F32-input fallback. */
     }
+    if (width == 20480u && outputs == 24u && rows >= 2u && rows <= 7u &&
+        v41_rows_f16_enabled() && !g_quality_mode && !cuda_runtime_config()->graph_dump &&
+        ds4_rocm_is_gfx1151()) {
+        const __half *w = (const __half *)cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
+        if (!w) return 0;
+        float *o = (float *)out->ptr;
+        const float *xin = (const float *)in->ptr;
+        switch (rows) {
+        case 2: v41_hc_ordered_rows_kernel<2><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        case 3: v41_hc_ordered_rows_kernel<3><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        case 4: v41_hc_ordered_rows_kernel<4><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        case 5: v41_hc_ordered_rows_kernel<5><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        case 6: v41_hc_ordered_rows_kernel<6><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        default: v41_hc_ordered_rows_kernel<7><<<outputs, 32u>>>(o, w, xin, width, outputs); break;
+        }
+        return cuda_ok(cudaGetLastError(), "V4.1 HC ordered rows");
+    }
     if (width == 20480u && outputs == 24u && rows >= 8u && rows <= 2048u &&
         ds4_rocm_is_gfx1151()) {
         const __half *w = (const __half *)cuda_model_range_ptr(
@@ -1004,6 +1109,27 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
                 (float *)out->ptr, w, (const float *)in->ptr, width, outputs, rows);
         }
         return cuda_ok(cudaGetLastError(), "V4.1 F32-input HC projection");
+    }
+    /* Rows 2..8 where the one-row decode would take the shared-X kernel: one pass. */
+    if (rows >= 2u && rows <= 8u && width <= 8192u && (width % 256u) == 0u &&
+        !(width == 4096u && outputs == 256u) && !g_quality_mode &&
+        !cuda_runtime_config()->graph_dump && v41_rows_f16_enabled()) {
+        const __half *w = (const __half *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes, "V4.1 F16 rows");
+        if (!w) return 0;
+        const unsigned blocks = (outputs + 31u) / 32u;
+        float *o = (float *)out->ptr;
+        const float *xin = (const float *)in->ptr;
+        switch (rows) {
+        case 2: v41_f16_sharedx_rows_kernel<2><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        case 3: v41_f16_sharedx_rows_kernel<3><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        case 4: v41_f16_sharedx_rows_kernel<4><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        case 5: v41_f16_sharedx_rows_kernel<5><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        case 6: v41_f16_sharedx_rows_kernel<6><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        case 7: v41_f16_sharedx_rows_kernel<7><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        default: v41_f16_sharedx_rows_kernel<8><<<blocks, 1024u>>>(o, w, xin, width, outputs); break;
+        }
+        return cuda_ok(cudaGetLastError(), "V4.1 F16 shared-X rows");
     }
     /* The general batched F16 API casts inputs to F16. Row views preserve decode arithmetic and retain F32 activations. */
     for (uint32_t row = 0; row < rows; row++) {
@@ -1105,6 +1231,51 @@ __global__ static void dsv41_markov_part_kernel(const float *logits, const void 
     }
 }
 
+/* Halo: one wave per vocabulary row. The per-thread row walk above reads the
+ * 256-wide head rows uncoalesced (7.5 ms per step on gfx1151); here the 32 lanes
+ * read a row's halves in order and reduce, one argmax per wave. */
+__global__ static void dsv41_markov_part_wave_kernel(const float *logits, const void *embed, const void *head,
+                                                     const int *tokens, float *part_val, int *part_idx,
+                                                     uint32_t vocab, uint32_t rank, uint32_t step,
+                                                     uint32_t n_parts, int f16) {
+    extern __shared__ float e[];
+    __shared__ float wv[32];
+    __shared__ int wi[32];
+    const int prev = tokens[step];
+    for (uint32_t r = threadIdx.x; r < rank; r += blockDim.x)
+        e[r] = dsv41_markov_tab(embed, (uint64_t)prev * rank + r, f16);
+    __syncthreads();
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5u, waves = blockDim.x >> 5u;
+    const float *lg = logits + (uint64_t)step * vocab;
+    float best = -INFINITY;
+    int bi = -1;
+    for (uint32_t v = blockIdx.x * waves + wave; v < vocab; v += n_parts * waves) {
+        float acc = 0.0f;
+        if (f16) {
+            const __half *row = (const __half *)head + (uint64_t)v * rank;
+            for (uint32_t r = lane * 2u; r < rank; r += 64u) {
+                const float2 f = __half22float2(*(const __half2 *)(row + r));
+                acc = fmaf(f.x, e[r], acc);
+                acc = fmaf(f.y, e[r + 1u], acc);
+            }
+        } else {
+            const float *row = (const float *)head + (uint64_t)v * rank;
+            for (uint32_t r = lane; r < rank; r += 32u) acc = fmaf(row[r], e[r], acc);
+        }
+        acc = warp_sum_f32(acc);
+        const float pv = lg[v] + acc;
+        if (pv > best || (pv == best && (int)v < bi)) { best = pv; bi = (int)v; }
+    }
+    if (lane == 0u) { wv[wave] = best; wi[wave] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        best = wv[0]; bi = wi[0];
+        for (uint32_t k = 1; k < waves; k++)
+            if (wi[k] >= 0 && (bi < 0 || wv[k] > best || (wv[k] == best && wi[k] < bi))) { best = wv[k]; bi = wi[k]; }
+        part_val[blockIdx.x] = best; part_idx[blockIdx.x] = bi;
+    }
+}
+
 __global__ static void dsv41_markov_final_kernel(const float *part_val, const int *part_idx, int *tokens,
                                                  const float *x, const void *embed, const float *conf_proj,
                                                  float *conf, uint32_t rank, uint32_t dim, uint32_t step,
@@ -1158,9 +1329,14 @@ extern "C" int ds4_gpu_dsv41_markov_chain(uint32_t block, uint32_t vocab, uint32
     float *part_val = (float *)parts->ptr;
     int *part_idx = (int *)((float *)parts->ptr + n_parts);
     for (uint32_t step = 0; step < block; step++) {
-        dsv41_markov_part_kernel<<<n_parts, 256, rank * sizeof(float)>>>(
-            (const float *)logits->ptr, embed, head, (const int *)tokens->ptr, part_val, part_idx,
-            vocab, rank, step, n_parts, f16);
+        if (rank % 64u == 0u && !getenv("DS4_ROCM_V41_MARKOV_SCALAR"))
+            dsv41_markov_part_wave_kernel<<<n_parts, 256, rank * sizeof(float)>>>(
+                (const float *)logits->ptr, embed, head, (const int *)tokens->ptr, part_val, part_idx,
+                vocab, rank, step, n_parts, f16);
+        else
+            dsv41_markov_part_kernel<<<n_parts, 256, rank * sizeof(float)>>>(
+                (const float *)logits->ptr, embed, head, (const int *)tokens->ptr, part_val, part_idx,
+                vocab, rank, step, n_parts, f16);
         dsv41_markov_final_kernel<<<1, 256>>>(
             part_val, part_idx, (int *)tokens->ptr, (const float *)x->ptr, embed,
             (const float *)conf_proj->ptr, (float *)conf->ptr, rank, dim, step, n_parts, f16);
