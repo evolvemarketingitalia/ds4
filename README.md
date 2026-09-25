@@ -2,6 +2,14 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> **About this fork (Alessandro Puricelli).** Branch `strix-halo-v41-dspark` is the DwarfStar
+> engine we run on one AMD Strix Halo. It adds DSpark speculative decoding for DeepSeek V4.1 Flash on
+> ROCm with SSD-streamed experts. Code edits reach 31.7 tok/s, against 13.8 without DSpark. Decode without
+> DSpark also improves, from 10.4 to 14 tok/s. Results, how to reproduce them and full credits are in
+> [docs/STRIX_HALO_DSPARK.md](docs/STRIX_HALO_DSPARK.md). The work was done with Claude Opus 5.5
+> (Anthropic). It builds on antirez's DwarfStar and kyuz0's ROCm port, merges #1089 unchanged and ports
+> #1073 to ROCm. All credit for the engine goes to the upstream authors.
+
 **DwarfStar** aims to be the best way to run a few excellent large
 language models on consumer hardware (that is, hardware that people
 can actually own). To reach this goal, we are building
