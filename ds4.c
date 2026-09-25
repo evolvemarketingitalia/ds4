@@ -40321,12 +40321,17 @@ static uint32_t ds41_engram_host_capacity(uint32_t prefill, uint32_t carry) {
  * rows.  A pass captures its positions' means; a decode or prefill pass commits
  * them, a verify pass commits the accepted prefix. */
 #define DS41_DRAFT_WINDOW 128u
+/* The rings keep this many positions (slot = pos % RING) so a session rewind
+ * finds the 128 rows before its new frontier intact, as the trunk's raw_log does
+ * for its window; ring_lo/ring_hi bound the positions that are valid. */
+#define DS41_DRAFT_RING 4096u
 typedef struct {
     const ds4_dspark_weights *w;
     const ds4_model *m;              /* the file holding the stages */
     uint32_t n_stage, block, n_target, rank, noise_token;
     uint32_t targets[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t mh_pos0, mh_rows;       /* the positions the last pass captured */
+    uint32_t ring_lo, ring_hi;       /* positions [ring_lo, ring_hi) hold valid ring rows */
     uint32_t verify_rows;            /* nonzero while a verify pass runs */
     double plain_rate, draft_rate;   /* tokens per second of plain and proposing cycles */
     uint32_t skip_left, skip_len;    /* proposals skipped while drafting loses */
@@ -40511,7 +40516,7 @@ static ds4_context_memory ds41_graph_memory(uint32_t ctx) {
 static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
-    if (g->draft) g->draft->mh_rows = 0;
+    if (g->draft) g->draft->mh_rows = g->draft->ring_lo = g->draft->ring_hi = 0;
     ds4_engram_history_reset(&g->history);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
@@ -41094,12 +41099,201 @@ static bool ds41_stream_table(const ds4_model *m, const ds4_layer_weights *l,
     return true;
 }
 
+/* Research probe (DS4_V41_PREDICT_PROBE=1): how well the routers of layers il+1 and
+ * il+2, applied to layer il's normalized FFN input, predict what those layers select.
+ * Reports the recall of the top-6 and top-12 candidates, and of the previous token's
+ * selection at the same layer, at exit. */
+#define DS41_PROBE_MAXL 64
+static struct {
+    ds4_gpu_tensor *logits, *sel, *w, *probs;
+    int32_t pred[2][DS41_PROBE_MAXL][12];
+    bool have[2][DS41_PROBE_MAXL];
+    int32_t prev[DS41_PROBE_MAXL][6];
+    bool have_prev[DS41_PROBE_MAXL];
+    uint64_t n[2][DS41_PROBE_MAXL], hit6[2][DS41_PROBE_MAXL], hit12[2][DS41_PROBE_MAXL];
+    uint64_t nprev[DS41_PROBE_MAXL], hitprev[DS41_PROBE_MAXL], mismatch;
+} g_probe;
+
+static int ds41_predict_probe_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_V41_PREDICT_PROBE") != NULL;
+    return on;
+}
+
+static void ds41_predict_probe_report(void) {
+    uint64_t n[2] = {0, 0}, h6[2] = {0, 0}, h12[2] = {0, 0}, np = 0, hp = 0;
+    for (int d = 0; d < 2; d++)
+        for (int il = 0; il < DS41_PROBE_MAXL; il++) {
+            n[d] += g_probe.n[d][il]; h6[d] += g_probe.hit6[d][il]; h12[d] += g_probe.hit12[d][il];
+        }
+    for (int il = 0; il < DS41_PROBE_MAXL; il++) { np += g_probe.nprev[il]; hp += g_probe.hitprev[il]; }
+#define DS41_PR(a, b) ((b) ? (double)(a) / (double)(b) : 0.0)
+    fprintf(stderr, "ds4: V4.1 predict probe L+1 recall@6=%.3f @12=%.3f  L+2 recall@6=%.3f @12=%.3f"
+            "  prev-token recall=%.3f  samples=%llu mismatch=%llu\n",
+            DS41_PR(h6[0], n[0]), DS41_PR(h12[0], n[0]), DS41_PR(h6[1], n[1]), DS41_PR(h12[1], n[1]),
+            DS41_PR(hp, np), (unsigned long long)n[0], (unsigned long long)g_probe.mismatch);
+    fprintf(stderr, "ds4: V4.1 predict probe per layer L+1 @6/@12/prev:");
+    for (int il = 1; il < DS41_PROBE_MAXL; il++) {
+        if (!g_probe.n[0][il]) continue;
+        fprintf(stderr, " %d:%.2f/%.2f/%.2f", il, DS41_PR(g_probe.hit6[0][il], g_probe.n[0][il]),
+                DS41_PR(g_probe.hit12[0][il], g_probe.n[0][il]),
+                DS41_PR(g_probe.hitprev[il], g_probe.nprev[il]));
+    }
+    fprintf(stderr, "\n");
+#undef DS41_PR
+}
+
+static void ds41_predict_probe(ds41_gpu_graph *g, const ds4_model *m,
+                               const ds4_layer_weights *l, uint32_t il) {
+    if (il >= DS41_PROBE_MAXL || DS4_N_EXPERT != 384u || DS4_N_EXPERT_USED != 6u) return;
+    if (!g_probe.logits) {
+        g_probe.logits = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        g_probe.sel = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(int32_t));
+        g_probe.w = ds4_gpu_tensor_alloc(DS4_N_EXPERT_USED * sizeof(float));
+        g_probe.probs = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
+        if (!g_probe.logits || !g_probe.sel || !g_probe.w || !g_probe.probs) return;
+        atexit(ds41_predict_probe_report);
+    }
+    static uint64_t calls;
+    if (il == 0 && ++calls % 256u == 0) ds41_predict_probe_report();
+    int32_t actual[6];
+    if (!ds4_gpu_tensor_read(g->selected, 0, actual, sizeof(actual))) return;
+    for (int d = 0; d < 2; d++) {
+        if (!g_probe.have[d][il]) continue;
+        g_probe.n[d][il] += 6;
+        for (int a = 0; a < 6; a++)
+            for (int j = 0; j < 12; j++)
+                if (g_probe.pred[d][il][j] == actual[a]) {
+                    if (j < 6) g_probe.hit6[d][il]++;
+                    g_probe.hit12[d][il]++;
+                    break;
+                }
+        g_probe.have[d][il] = false;
+    }
+    if (g_probe.have_prev[il]) {
+        g_probe.nprev[il] += 6;
+        for (int a = 0; a < 6; a++)
+            for (int j = 0; j < 6; j++)
+                if (g_probe.prev[il][j] == actual[a]) { g_probe.hitprev[il]++; break; }
+    }
+    memcpy(g_probe.prev[il], actual, sizeof(actual));
+    g_probe.have_prev[il] = true;
+    for (int d = 0; d < 2; d++) {
+        const uint32_t t = il + 1u + (uint32_t)d;
+        if (t >= DS4_N_LAYER || t >= DS41_PROBE_MAXL) break;
+        const ds4_layer_weights *lt = l + 1 + d;
+        const ds4_tensor *bias = lt->ffn_exp_probs_b;
+        if (!bias || !lt->ffn_gate_inp) continue;
+        float probs[384];
+        int32_t sel[6];
+        if (!ds41_matmul(g_probe.logits, m, lt->ffn_gate_inp, g->norm, false) ||
+            !ds4_gpu_router_select_tensor(g_probe.sel, g_probe.w, g_probe.probs, m->map, m->size,
+                bias->abs_offset, 0, 0, 0, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false, g_probe.logits) ||
+            !ds4_gpu_tensor_read(g_probe.probs, 0, probs, sizeof(probs)) ||
+            !ds4_gpu_tensor_read(g_probe.sel, 0, sel, sizeof(sel))) return;
+        const float *b = (const float *)((const char *)m->map + bias->abs_offset);
+        float s[384];
+        for (int e = 0; e < 384; e++) s[e] = probs[e] + b[e];
+        for (int j = 0; j < 12; j++) {
+            int best = 0;
+            for (int e = 1; e < 384; e++) if (s[e] > s[best]) best = e;
+            g_probe.pred[d][t][j] = best;
+            s[best] = -INFINITY;
+        }
+        for (int a = 0; a < 6; a++) {
+            bool found = false;
+            for (int j = 0; j < 6; j++) found = found || g_probe.pred[d][t][j] == sel[a];
+            if (!found) g_probe.mismatch++;
+        }
+        g_probe.have[d][t] = true;
+    }
+}
+
+/* Halo lookahead prefetch: layer il+1's router applied to layer il's FFN input ranks
+ * candidates for il+1 (recall 0.71 at top-6 and 0.86 at top-12 per row, measured with
+ * DS4_V41_PREDICT_PROBE on a 12k code prompt); the stream cache reads the non-resident
+ * ones in the background once il's own misses have landed.
+ * Measured 25/09 at 12k context: top-6 with one expert per layer cut decode misses
+ * 38% but the extra router pass and reads left decode flat (13.6 vs 13.8 t/s);
+ * top-12 with three read too many cold experts (9.6 t/s).  Off by default.
+ * DS4_V41_PREFETCH=<candidates per row> (0 = off). */
+static uint32_t ds41_prefetch_candidates(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_V41_PREFETCH");
+        v = e && e[0] ? atoi(e) : 0;
+        if (v < 0) v = 0;
+        if (v > 32) v = 32;
+    }
+    return (uint32_t)v;
+}
+
+static ds4_gpu_tensor *g_ds41_pred_logits;
+
+static bool ds41_prefetch_wanted(const ds41_gpu_graph *g, uint32_t il, uint32_t rows) {
+    return g->streaming && g->tp_world == 1u && ds41_prefetch_candidates() &&
+        il + 1u < DS4_N_LAYER && rows >= 1u && rows <= 8u &&
+        DS4_N_EXPERT == 384u && DS4_N_EXPERT_USED == 6u;
+}
+
+/* Enqueue the next layer's router logits for `rows` rows of `norm`. */
+static bool ds41_prefetch_predict(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  ds4_gpu_tensor *norm, uint32_t rows) {
+    if (!ds41_prefetch_wanted(g, il, rows) || !l[1].ffn_gate_inp) return true;
+    if (!g_ds41_pred_logits) {
+        g_ds41_pred_logits = ds4_gpu_tensor_alloc((uint64_t)8u * DS4_N_EXPERT * sizeof(float));
+        if (!g_ds41_pred_logits) return true;
+    }
+    return rows == 1u ? ds41_matmul(g_ds41_pred_logits, m, l[1].ffn_gate_inp, norm, false)
+                      : ds41_matmul_batch(g_ds41_pred_logits, m, l[1].ffn_gate_inp, norm, rows, false);
+}
+
+/* Read the predicted logits, rank each row's candidates, interleave the rows by rank
+ * and arm the stream cache for layer il+1. Best effort: never fails the step. */
+static void ds41_prefetch_arm(ds41_gpu_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t il, uint32_t rows) {
+    if (!ds41_prefetch_wanted(g, il, rows) || !l[1].ffn_gate_inp || !g_ds41_pred_logits) return;
+    const ds4_layer_weights *ln = l + 1;
+    const ds4_tensor *bias = ds41_image_at(g, g->pos) ? ln->ffn_exp_probs_vl : ln->ffn_exp_probs_b;
+    if (!bias) return;
+    float logits[8 * 384];
+    if (!ds4_gpu_tensor_read(g_ds41_pred_logits, 0, logits, (uint64_t)rows * 384u * sizeof(float))) return;
+    const float *b = (const float *)((const char *)m->map + bias->abs_offset);
+    const uint32_t k = ds41_prefetch_candidates();
+    int32_t rank[8][32];
+    for (uint32_t r = 0; r < rows; r++) {
+        float s[384];
+        for (uint32_t e = 0; e < 384u; e++) {
+            const float x = logits[r * 384u + e];
+            s[e] = sqrtf(x > 20.0f ? x : log1pf(expf(x))) + b[e];
+        }
+        for (uint32_t j = 0; j < k; j++) {
+            uint32_t best = 0;
+            for (uint32_t e = 1; e < 384u; e++) if (s[e] > s[best]) best = e;
+            rank[r][j] = (int32_t)best;
+            s[best] = -INFINITY;
+        }
+    }
+    int32_t ids[8 * 32];
+    uint32_t n = 0;
+    bool seen[384] = {false};
+    for (uint32_t j = 0; j < k; j++)
+        for (uint32_t r = 0; r < rows; r++)
+            if (!seen[rank[r][j]]) { seen[rank[r][j]] = true; ids[n++] = rank[r][j]; }
+    ds4_gpu_stream_expert_table table;
+    if (!ds41_stream_table(m, ln, il + 1u, &table)) return;
+    (void)ds4_gpu_stream_expert_cache_arm_prefetch(&table, ids, n, rows == 1u ? 3u : 8u);
+}
+
 static bool ds41_stream_selected_begin(ds41_gpu_graph *g, const ds4_model *m,
                                         const ds4_layer_weights *l, uint32_t il) {
     ds4_gpu_stream_expert_table table;
     int32_t selected[6];
     if (!ds41_stream_table(m, l, il, &table) ||
         !ds4_gpu_tensor_read(g->selected, 0, selected, sizeof(selected))) return false;
+    ds41_prefetch_arm(g, m, l, il, 1u);
     for (uint32_t i = 0; i < 6; i++)
         if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) return false;
     return ds4_gpu_routed_moe_set_selected_override(selected, 6) &&
@@ -41123,6 +41317,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
 #ifdef DS4_ROCM_BUILD
+    if (!ds41_prefetch_predict(g, m, l, il, g->norm, 1u)) return false;
+    if (g->streaming && g->tp_world == 1u && ds41_predict_probe_on())
+        ds41_predict_probe(g, m, l, il);
     /* Start expert I/O before enqueuing the independent shared expert. The
      * routed consumer joins the matching compact table and upload event. */
     if (g->streaming && !ds41_stream_selected_begin(g, m, l, il)) return false;
@@ -41684,9 +41881,30 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
-        ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
+#ifdef DS4_ROCM_BUILD
+    if (ds41_prefetch_wanted(g, il, count)) {
+        if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
+            !ds41_route_batch(g, m, l, count) ||
+            !ds41_prefetch_predict(g, m, l, il, b->norm, count)) return false;
+        ds41_prefetch_arm(g, m, l, il, count);
+    } else
+#endif
+    if (!ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) ||
+        !ds41_route_batch(g, m, l, count)) return false;
+#ifdef DS4_ROCM_BUILD
+    /* Halo DSpark verify: start the rows' expert misses now, so the SSD reads
+     * overlap the shared expert and the resident experts (the routed launch
+     * takes the hit/miss split when this pending set matches). */
+    if (g->streaming && g->tp_world == 1u && count >= 2u && count <= 8u &&
+        DS4_N_EXPERT == 384u && DS4_N_EXPERT_USED == 6u && !getenv("DS4_ROCM_V41_ROWS_SPLIT_OFF")) {
+        int32_t ids[8 * 6];
+        ds4_gpu_stream_expert_table table;
+        if (!ds41_stream_table(m, l, il, &table) ||
+            !ds4_gpu_tensor_read(b->selected, 0, ids, (uint64_t)count * 6u * sizeof(int32_t)) ||
+            !ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, ids, count, 6u)) return false;
+    }
+#endif
+    return ((shared_owner && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
@@ -42993,15 +43211,23 @@ static bool ds41_draft_commit(ds41_gpu_graph *g, uint32_t rows) {
     if (rows > d->mh_rows) return false;
     const uint32_t first = rows > DS41_DRAFT_WINDOW ? rows - DS41_DRAFT_WINDOW : 0u;
     for (uint32_t st = 0; st < d->n_stage; st++) {
-        const uint64_t base = (uint64_t)st * DS41_DRAFT_WINDOW * row;
+        const uint64_t base = (uint64_t)st * DS41_DRAFT_RING * row;
+        const uint64_t src = (uint64_t)st * DS41_DRAFT_WINDOW * row;
         for (uint32_t r = first; r < rows;) {
-            const uint32_t slot = (d->mh_pos0 + r) % DS41_DRAFT_WINDOW;
-            uint32_t run = DS41_DRAFT_WINDOW - slot;
+            const uint32_t slot = (d->mh_pos0 + r) % DS41_DRAFT_RING;
+            uint32_t run = DS41_DRAFT_RING - slot;
             if (run > rows - r) run = rows - r;
-            if (!ds4_gpu_tensor_copy(d->ring, base + slot * row, d->pending, base + r * row, run * row))
+            if (!ds4_gpu_tensor_copy(d->ring, base + slot * row, d->pending, src + r * row, run * row))
                 return false;
             r += run;
         }
+    }
+    if (rows > first) {
+        const uint32_t lo = d->mh_pos0 + first, hi = d->mh_pos0 + rows;
+        if (hi < d->ring_lo || lo > d->ring_hi) d->ring_lo = lo;   /* a gap: restart the run */
+        else if (lo < d->ring_lo) d->ring_lo = lo;
+        d->ring_hi = hi;
+        if (hi - d->ring_lo > DS41_DRAFT_RING) d->ring_lo = hi - DS41_DRAFT_RING;
     }
     return true;
 }
@@ -43013,11 +43239,14 @@ static bool ds41_draft_attention(ds41_gpu_graph *g, uint32_t stage, const ds4_la
     ds41_draft *d = g->draft;
     ds41_prefill_row *b = &g->batch;
     const uint32_t start = d->mh_pos0 + d->mh_rows;   /* P + 1 */
-    const uint32_t past = start < DS41_DRAFT_WINDOW ? start : DS41_DRAFT_WINDOW;
+    /* only rows the rings still hold for positions before start */
+    const uint32_t valid_hi = d->ring_hi < start ? d->ring_hi : start;
+    const uint32_t valid = valid_hi > d->ring_lo ? valid_hi - d->ring_lo : 0u;
+    const uint32_t past = valid_hi < start ? 0u : (valid < DS41_DRAFT_WINDOW ? valid : DS41_DRAFT_WINDOW);
     const uint64_t row = (uint64_t)DS4_N_HEAD_DIM * sizeof(float);
-    const uint64_t ring = (uint64_t)stage * DS41_DRAFT_WINDOW * row;
-    const uint32_t slot0 = (start - past) % DS41_DRAFT_WINDOW;
-    const uint32_t first = past < DS41_DRAFT_WINDOW - slot0 ? past : DS41_DRAFT_WINDOW - slot0;
+    const uint64_t ring = (uint64_t)stage * DS41_DRAFT_RING * row;
+    const uint32_t slot0 = (start - past) % DS41_DRAFT_RING;
+    const uint32_t first = past < DS41_DRAFT_RING - slot0 ? past : DS41_DRAFT_RING - slot0;
     return ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, DS4_N_HEAD, count, start, false, false) &&
         ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, count, start, false, false) &&
         (!first || ds4_gpu_tensor_copy(d->raw, 0, d->ring, ring + slot0 * row, first * row)) &&
@@ -43187,7 +43416,7 @@ static bool ds41_draft_init(ds41_gpu_graph *g, const ds4_dspark_weights *dw, con
     if (!proj || proj->type != DS4_TENSOR_F32 || proj->bytes < proj_bytes ||
         !(d->mh = ds4_gpu_tensor_alloc(win * d->n_target * dim * sizeof(float))) ||
         !(d->pending = ds4_gpu_tensor_alloc(d->n_stage * win * hd * sizeof(float))) ||
-        !(d->ring = ds4_gpu_tensor_alloc(d->n_stage * win * hd * sizeof(float))) ||
+        !(d->ring = ds4_gpu_tensor_alloc(d->n_stage * (uint64_t)DS41_DRAFT_RING * hd * sizeof(float))) ||
         !(d->raw = ds4_gpu_tensor_alloc((win + B) * hd * sizeof(float))) ||
         !(d->conf_proj = ds4_gpu_tensor_alloc(proj_bytes)) ||
         !(d->tokens = ds4_gpu_tensor_alloc_managed((B + 1u) * sizeof(int32_t))) ||
@@ -43222,8 +43451,16 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
     d->verify_rows = n;
     d->mh_pos0 = g->pos;
     d->mh_rows = n;
-    bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 1, n, true) &&
-        ds41_graph_step_batch(graphs, tokens, (int)n, n, m, w);
+    static int timing = -1;
+    if (timing < 0) timing = getenv("DS4_DSPARK_V41_TIMING") ? 1 : 0;
+    const double tt0 = timing ? now_sec() : 0.0;
+    bool ok = ds4_gpu_begin_commands() && ds41_draft_slots(g, g->pos, 1, n, true);
+    if (timing && ok) { ok = ds4_gpu_end_commands() && ds4_gpu_synchronize() && ds4_gpu_begin_commands(); }
+    const double tt1 = timing ? now_sec() : 0.0;
+    ok = ok && ds41_graph_step_batch(graphs, tokens, (int)n, n, m, w);
+    if (timing && ok) { if (ds4_gpu_commands_active()) ok = ds4_gpu_end_commands(); ok = ok && ds4_gpu_synchronize() && ds4_gpu_begin_commands(); }
+    const double tt2 = timing ? now_sec() : 0.0;
+    double tt3 = tt2;
     if (ok) {
         /* every row's logits, from the batch's last-layer stream */
         ds4_gpu_tensor *res = ds4_gpu_tensor_view(g->batch.residual, 0, (uint64_t)n * DS4_N_HC * DS4_N_EMBD * 4u);
@@ -43235,16 +43472,24 @@ static bool ds41_draft_verify(ds41_gpu_graph *g, const ds4_model *m, const ds4_w
             ds4_gpu_hc_weighted_sum_split_tensor(x, res, split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(x, DS4_N_EMBD, n, DS4_V41_BF16) &&
             ds41_norm_batch(xn, x, m, w->output_norm, n) &&
-            ds41_output_projection(g, d->rows_logits, m, w, xn, n) &&
-            ds41_draft_pending(g);
+            ds41_output_projection(g, d->rows_logits, m, w, xn, n);
+        if (timing && ok) { if (ds4_gpu_commands_active()) ok = ds4_gpu_end_commands(); ok = ok && ds4_gpu_synchronize() && ds4_gpu_begin_commands(); }
+        tt3 = timing ? now_sec() : 0.0;
+        ok = ok && ds41_draft_pending(g);
         ds4_gpu_tensor_free(xn); ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(split); ds4_gpu_tensor_free(res);
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    const double tt4 = timing ? now_sec() : 0.0;
     d->verify_rows = 0;
     if (!ok) { g->valid = false; return false; }
-    return !logits_rows || ds4_gpu_tensor_read(d->rows_logits, 0, logits_rows,
+    const bool read_ok = !logits_rows || ds4_gpu_tensor_read(d->rows_logits, 0, logits_rows,
                                                 (uint64_t)n * DS4_N_VOCAB * sizeof(float));
+    if (timing)
+        fprintf(stderr, "ds4: DSpark V4.1 verify rows=%u slots=%.1f step=%.1f head=%.1f pending=%.1f read=%.1f ms\n",
+                n, (tt1 - tt0) * 1e3, (tt2 - tt1) * 1e3, (tt3 - tt2) * 1e3, (tt4 - tt3) * 1e3,
+                (now_sec() - tt4) * 1e3);
+    return read_ok;
 }
 
 /* Keep the first `accepted` of the `n` verified rows: the frontier, the n-gram

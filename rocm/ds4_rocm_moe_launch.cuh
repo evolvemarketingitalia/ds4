@@ -686,7 +686,6 @@ static int routed_moe_launch(
                                         gate_bytes,
                                         down_bytes);
     const int batch_stream_split_selected =
-        !v41_small_wave &&
         !stream_full_layer &&
         !full_table_cached &&
         n_tokens > 1u &&
@@ -957,7 +956,43 @@ static int routed_moe_launch(
         }
         if (ok && (batch_stream_selected || batch_stream_split_selected)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, pair_count, 1);
-            if (batch_stream_split_selected) {
+            if (batch_stream_split_selected && v41_small_wave) {
+                /* Halo DSpark verify: resident experts run while the misses are
+                 * still in flight (#1083-style hit/miss split, same per-row wave
+                 * arithmetic). The tables hold NULL for the other half, which the
+                 * wave kernel skips. */
+                for (uint32_t tok = 0; ok && stream_batch_resident_count != 0u && tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        resident_gate_slot_ptrs, resident_up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe small-batch resident wave launch");
+                if (!ok) {
+                    (void)cuda_stream_batch_selected_finish_pending_missing();
+                } else {
+                    ok = cuda_stream_batch_selected_finish_pending_missing();
+                }
+                for (uint32_t tok = 0; ok && stream_batch_missing_count != 0u && tok < n_tokens; tok++) {
+                    const uint64_t pair0 = (uint64_t)tok * n_expert;
+                    moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
+                        (float *)gate->ptr + pair0 * expert_mid_dim,
+                        (float *)up->ptr + pair0 * expert_mid_dim,
+                        (float *)mid->ptr + pair0 * expert_mid_dim,
+                        missing_gate_slot_ptrs, missing_up_slot_ptrs, xq + (uint64_t)tok * xq_blocks,
+                        (const int32_t *)selected_exec->ptr + pair0,
+                        (const float *)weights->ptr + pair0,
+                        0, gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                        0u, (1u << n_expert) - 1u, clamp);
+                }
+                ok = ok && cuda_ok(cudaGetLastError(), "routed_moe small-batch missing wave launch");
+            } else if (batch_stream_split_selected) {
                 if (stream_batch_resident_count != 0u) {
                     moe_gate_up_mid_qwarp32_ptrs_split_kernel<<<qgrid, 256>>>(
                             (float *)gate->ptr,

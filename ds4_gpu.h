@@ -395,6 +395,13 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected);
+/* Arm ranked candidates for the next streamed layer; the non-resident ones are read
+ * in the background once the current layer's own misses have landed (ROCm). */
+int ds4_gpu_stream_expert_cache_arm_prefetch(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *ids,
+        uint32_t                           n_ids,
+        uint32_t                           max_experts);
 int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
         const ds4_gpu_stream_expert_table *table,
         const ds4_gpu_tensor              *selected,
