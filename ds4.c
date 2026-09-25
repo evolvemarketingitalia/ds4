@@ -85960,13 +85960,27 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 }
 
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-static bool ds41_draft_adapt_off(void) {
-    static int cache = -1;
-    if (cache < 0) {
-        const char *env = getenv("DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING");
-        cache = (env && env[0] && strcmp(env, "0") != 0) ? 1 : 0;
+/* Greedy V4.1 drafting runs without proposal-rate adaptation: on Strix Halo prose it skipped
+ * about a third of the cycles, although the confidence gate already drops the proposals that
+ * do not pay.  DS4_DSPARK_V41_ADAPTIVE_DRAFTING=1 brings it back; sampling keeps it, since
+ * these measurements did not cover it.  DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING turns it off. */
+static bool ds41_draft_adapt_off(bool sampling) {
+    static int on = -1, off = -1;
+    if (on < 0) {
+        const char *e1 = getenv("DS4_DSPARK_V41_ADAPTIVE_DRAFTING");
+        const char *e2 = getenv("DS4_DSPARK_DISABLE_ADAPTIVE_DRAFTING");
+        on = (e1 && e1[0] && strcmp(e1, "0") != 0) ? 1 : 0;
+        off = (e2 && e2[0] && strcmp(e2, "0") != 0) ? 1 : 0;
     }
-    return cache == 1;
+    return off == 1 || (!sampling && on == 0);
+}
+
+/* The V4.1 confidence head is calibrated: acceptance in each confidence band matches its
+ * probability, in Italian and English alike.  An extra verify row costs ~18 ms against ~73 ms
+ * for a decode step on Strix Halo, so greedy drafts pay from about 0.5.  --dspark-confidence
+ * still sets the threshold, and sampling keeps the backend default. */
+static float ds41_draft_threshold(const ds4_engine *e, bool sampling) {
+    return e->dspark_confidence_threshold_set || sampling ? e->dspark_confidence_threshold : 0.5f;
 }
 
 /* Prose rarely passes the confidence gate, and a proposal that yields nothing still
@@ -86017,7 +86031,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
     /* the block continues the position whose stream the last pass captured */
     const bool draftable = P1 >= 1u && d->mh_rows && P1 - 1u >= d->mh_pos0 &&
         P1 - 1u < d->mh_pos0 + d->mh_rows && P1 + B < g->ctx && max_tokens > 1 && accepted_cap > 1;
-    const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off());
+    const bool proposed = draftable && (!d->skip_left || ds41_draft_adapt_off(exact));
     if (draftable && !proposed) {
         d->skip_left--;
         if (stats) s->dspark_stats.scheduler_skips++;
@@ -86030,7 +86044,7 @@ static int ds41_session_spec(ds4_session *s, int first_token, int max_tokens, in
         }
         propose_s = now_sec() - tp;
         if (stats) s->dspark_stats.propose_ms += propose_s * 1000.0;
-        k = dspark_confident_prefix_len(conf, B, e->dspark_confidence_threshold);
+        k = dspark_confident_prefix_len(conf, B, ds41_draft_threshold(e, exact));
         if (k > (uint32_t)max_draft) k = (uint32_t)max_draft;
         if (k > (uint32_t)max_tokens - 1u) k = (uint32_t)max_tokens - 1u;
         if (k > (uint32_t)accepted_cap - 1u) k = (uint32_t)accepted_cap - 1u;

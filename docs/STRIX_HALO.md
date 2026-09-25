@@ -156,8 +156,10 @@ DS4_ROCM_SELECTED_SPLIT=1 ./ds4-server --rocm -m "$MODEL" --vision "$VISION" \
 
 - **What stays resident.** The three draft stages (4.6 GB, 128 experts, top-3) stay resident; the trunk keeps
   streaming its experts.
-- **How drafting runs.** It is adaptive. Verify runs 2-6 rows through the same-session row batch, with per-row
-  arithmetic identical to decode.
+- **How drafting runs.** Verify runs 2-6 rows through the same-session row batch, with per-row arithmetic
+  identical to decode. Greedy requests verify the drafts up to the first one whose confidence is below 0.5
+  (`--dspark-confidence` overrides it), with no proposal-rate adaptation (`DS4_DSPARK_V41_ADAPTIVE_DRAFTING=1`
+  restores it). Sampling keeps 0.7 and the adaptation.
 - **Batched sessions.** With `--batched-session 1` speculation runs directly on the one resident session.
 
 Measured on a 12k-token prompt with greedy chat requests and `tools/strix-halo/bench_server.sh`. Values are
@@ -176,6 +178,23 @@ client-side decode tokens/s for the first and second identical request:
   decode, so a near-tie token can change.
 - **Expert prefetch.** Next-layer expert prefetch (`DS4_V41_PREFETCH`, off) reaches 71% recall at top-6, but the
   extra router pass costs what the reads save.
+
+The table above was measured with the earlier greedy defaults: threshold 0.7 and proposal-rate adaptation. With
+`DS4_DSPARK_SPEC_LOG=1` the log prints each draft position's confidence and the accepted length. On 1,180 cycles of
+Italian and English prose, the acceptance in each confidence band matched the head's probability in both
+languages (Italian 70/79/86/97% and English 64/74/82/98% for the 0.6/0.7/0.8/0.9 bands). An extra verify row costs
+about 18 ms against 73 ms for a decode step, so drafts pay from about 0.5.
+
+Four Italian and four English requests (a 12k-token code review answered in prose, an essay, an explanation and an
+email), a code-writing request and the code rewrite above, up to 384 tokens, expert cache 68GB, two rounds. Values are
+client-side decode tokens/s, averaged per language:
+
+| Greedy DSpark policy | Italian | English | Code writing | Code rewrite |
+|---|---:|---:|---:|---:|
+| Threshold 0.7, adaptation on | 14.36 / 14.27 | 14.32 / 14.53 | 19.86 / 19.87 | 19.9 |
+| Threshold 0.5, adaptation off (now the default) | 15.41 / 15.48 | 15.54 / 15.44 | 19.97 / 19.92 | 19.9-20.0 |
+
+The code rewrite output is byte-identical between the two; on prose a near-tie token can change.
 
 ## GLM 5.3 Flash
 
