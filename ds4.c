@@ -40753,6 +40753,14 @@ static bool ds41_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
             weight->abs_offset, width, outputs, count, in);
     } else if (count >= 2 && count <= DS4_TP_BATCH_MAX_ROWS && weight->type == DS4_TENSOR_F32) {
         ok = true;
+#ifdef DS4_ROCM_BUILD
+        /* Halo: one launch of the decode kernel for all rows (the router of every verify layer). */
+        if (!getenv("DS4_ROCM_V41_ROWS_F32_OFF")) {
+            ok = ds4_gpu_matmul_f32_rows_exact_tensor(out, m->map, m->size, weight->abs_offset,
+                                                      width, outputs, in, count) != 0;
+            return ok && (!round || ds4_gpu_dsv41_quantize(out, outputs, count, DS4_V41_BF16));
+        }
+#endif
         for (uint32_t i = 0; ok && i < count; i++) {
             ds4_gpu_tensor *x = ds4_gpu_tensor_view((ds4_gpu_tensor *)in,
                 (uint64_t)i * width * sizeof(float), (uint64_t)width * sizeof(float));
@@ -41320,9 +41328,21 @@ static uint32_t ds41_prefetch_candidates(void) {
 
 static ds4_gpu_tensor *g_ds41_pred_logits;
 
+/* DS4_V41_PREFETCH_MIN_ROWS=2 keeps the lookahead to verify batches, whose layers are
+ * long enough (~5 ms at six rows) for the candidates to land before they are needed. */
+static uint32_t ds41_prefetch_min_rows(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_V41_PREFETCH_MIN_ROWS");
+        v = e && e[0] ? atoi(e) : 1;
+        if (v < 1) v = 1;
+    }
+    return (uint32_t)v;
+}
+
 static bool ds41_prefetch_wanted(const ds41_gpu_graph *g, uint32_t il, uint32_t rows) {
     return g->streaming && g->tp_world == 1u && ds41_prefetch_candidates() &&
-        il + 1u < DS4_N_LAYER && rows >= 1u && rows <= 8u &&
+        il + 1u < DS4_N_LAYER && rows >= ds41_prefetch_min_rows() && rows <= 8u &&
         DS4_N_EXPERT == 384u && DS4_N_EXPERT_USED == 6u;
 }
 
