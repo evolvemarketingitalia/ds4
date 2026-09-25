@@ -87452,8 +87452,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #endif
 #endif
     s->checkpoint.len = pos;
-    /* Image identities beyond the new frontier describe tokens that are gone. */
-    while (s->checkpoint_image_count > 0 &&
+    /* Image identities beyond the new frontier describe tokens that are gone.
+     * A failed rewind leaves them to the rebuild, which replaces them. */
+    while (state_ok && s->checkpoint_image_count > 0 &&
            s->checkpoint_images[s->checkpoint_image_count - 1].token_start >=
                (uint32_t)pos)
         s->checkpoint_image_count--;
