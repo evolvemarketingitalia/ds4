@@ -3034,13 +3034,15 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
     /* GLM 5.3 MTP verification (2 rows) and other tiny batches: the one-token
      * decode kernels (V4.1 wave gate/up and Q8_K down) read each routed
      * expert once per token, while the tiled batch kernels spend ~3.6x the
-     * one-token time on 2 rows.  Only with DS4_ROCM_GLM_WAVE_DECODE's topology. */
+     * one-token time on 2 rows.  Only with DS4_ROCM_GLM_WAVE_DECODE's topology,
+     * and only resident: under SSD streaming the selected experts are staged
+     * for the whole batch, so one-token slices would find no compact table. */
     static int small_split_env = -1;
     if (small_split_env < 0) {
         small_split_env = getenv("DS4_ROCM_GLM_WAVE_DECODE") != NULL &&
                           getenv("DS4_ROCM_DISABLE_MOE_SMALL_BATCH_SPLIT") == NULL;
     }
-    if (small_split_env && n_tokens >= 2u && n_tokens <= 4u &&
+    if (small_split_env && !g_ssd_streaming_mode && n_tokens >= 2u && n_tokens <= 4u &&
         !g_deepseek41_model && n_total_expert == 288u && n_expert == 8u &&
         expert_in_dim == 4096u && expert_mid_dim == 2048u && out_dim == 4096u &&
         out && gate && up && mid && down && selected && weights && x) {

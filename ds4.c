@@ -57094,7 +57094,7 @@ static bool glm_graph_forward_token(
                         (uint64_t)g->tp_rank * tp_head_count *
                         DS4_N_VALUE_MLA * value_row_bytes;
                 }
-bool group8_ok = false;
+                bool group8_ok = false;
                 if (ok) group8_ok = ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
                                                                                     tp_split_layer_heads ? tp_heads : g->heads,
                                                                                     g->attn_partial_lora,
