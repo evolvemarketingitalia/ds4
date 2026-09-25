@@ -397,6 +397,9 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         uint32_t                           n_selected);
 /* Arm ranked candidates for the next streamed layer; the non-resident ones are read
  * in the background once the current layer's own misses have landed (ROCm). */
+/* ROCm: F32 matvec for several rows with the one-row decode reduction. */
+int ds4_gpu_matmul_f32_rows_exact_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_stream_expert_cache_arm_prefetch(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *ids,

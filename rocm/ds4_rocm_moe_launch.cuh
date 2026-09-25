@@ -632,6 +632,19 @@ static int routed_moe_launch(
         const char *env = getenv("DS4_ROCM_V41_ROWS_MOE");
         v41_rows_moe = !(env && env[0] == '0');
     }
+    /* Rows grouped by expert (one DRAM read per shared expert), same per-row
+     * arithmetic; DS4_ROCM_V41_ROWS_DEDUP=0 keeps the one-launch-per-row path. */
+    static int v41_rows_dedup = -1;
+    static int32_t *v41_pairs = NULL;
+    if (v41_rows_dedup < 0) {
+        const char *env = getenv("DS4_ROCM_V41_ROWS_DEDUP");
+        v41_rows_dedup = !(env && env[0] == '0');
+        if (v41_rows_dedup && cudaMalloc((void **)&v41_pairs, 256u * sizeof(int32_t)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            v41_pairs = NULL;
+            v41_rows_dedup = 0;
+        }
+    }
     const int v41_small_wave =
         v41_rows_moe && g_deepseek41_model && iq2_path && !iq2_iq2_path &&
         n_tokens >= 2u && n_tokens <= 8u &&
@@ -961,7 +974,18 @@ static int routed_moe_launch(
                  * still in flight (#1083-style hit/miss split, same per-row wave
                  * arithmetic). The tables hold NULL for the other half, which the
                  * wave kernel skips. */
-                for (uint32_t tok = 0; ok && stream_batch_resident_count != 0u && tok < n_tokens; tok++) {
+                const int dedup = v41_rows_dedup && stream_batch_unique != 0u &&
+                    stream_batch_unique <= 64u && pair_count <= 64u;
+                if (dedup) {
+                    moe_v41_pairs_by_expert_kernel<<<1, 1>>>(v41_pairs, v41_pairs + 128,
+                        (const int32_t *)selected_exec->ptr, pair_count, stream_batch_unique);
+                    if (stream_batch_resident_count != 0u)
+                        moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                            (float *)mid->ptr, resident_gate_slot_ptrs, resident_up_slot_ptrs, xq,
+                            v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                            gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                }
+                for (uint32_t tok = 0; !dedup && ok && stream_batch_resident_count != 0u && tok < n_tokens; tok++) {
                     const uint64_t pair0 = (uint64_t)tok * n_expert;
                     moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
                         (float *)gate->ptr + pair0 * expert_mid_dim,
@@ -979,7 +1003,12 @@ static int routed_moe_launch(
                 } else {
                     ok = cuda_stream_batch_selected_finish_pending_missing();
                 }
-                for (uint32_t tok = 0; ok && stream_batch_missing_count != 0u && tok < n_tokens; tok++) {
+                if (dedup && ok && stream_batch_missing_count != 0u)
+                    moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                        (float *)mid->ptr, missing_gate_slot_ptrs, missing_up_slot_ptrs, xq,
+                        v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                        gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                for (uint32_t tok = 0; !dedup && ok && stream_batch_missing_count != 0u && tok < n_tokens; tok++) {
                     const uint64_t pair0 = (uint64_t)tok * n_expert;
                     moe_v41_gate_up_wave_ptrs_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, n_expert), 128>>>(
                         (float *)gate->ptr + pair0 * expert_mid_dim,
@@ -1040,6 +1069,15 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(),
                                  "routed_moe streaming batch missing gate/up launch");
                 }
+            } else if (v41_small_wave && v41_rows_dedup && stream_batch_unique != 0u &&
+                       stream_batch_unique <= 64u && pair_count <= 64u) {
+                moe_v41_pairs_by_expert_kernel<<<1, 1>>>(v41_pairs, v41_pairs + 128,
+                    (const int32_t *)selected_exec->ptr, pair_count, stream_batch_unique);
+                moe_v41_gate_up_wave_dedup_kernel<4><<<dim3((expert_mid_dim + 3u) / 4u, stream_batch_unique), 128>>>(
+                    (float *)mid->ptr, gate_slot_ptrs, up_slot_ptrs, xq,
+                    v41_pairs, v41_pairs + 128, (const float *)weights->ptr,
+                    gate_row_bytes, xq_blocks, expert_mid_dim, n_expert, clamp);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe small-batch dedup gate/up launch");
             } else if (v41_small_wave) {
                 for (uint32_t tok = 0; tok < n_tokens; tok++) {
                     const uint64_t pair0 = (uint64_t)tok * n_expert;
@@ -1083,7 +1121,12 @@ static int routed_moe_launch(
                         pair_count);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe streaming batch mid quantize launch");
             }
-            if (ok && v41_small_wave) {
+            if (ok && v41_small_wave && v41_rows_dedup) {
+                moe_v41_down_wave_tokens_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
+                    (float *)out->ptr, down_slot_ptrs, midq, (const int32_t *)selected_exec->ptr,
+                    down_row_bytes, midq_blocks, out_dim, n_expert, n_tokens);
+                ok = cuda_ok(cudaGetLastError(), "routed_moe small-batch tokens down launch");
+            } else if (ok && v41_small_wave) {
                 for (uint32_t tok = 0; tok < n_tokens; tok++) {
                     const uint64_t pair0 = (uint64_t)tok * n_expert;
                     moe_v41_down_wave_ptrs_kernel<4><<<(out_dim + 3u) / 4u, 128>>>(
